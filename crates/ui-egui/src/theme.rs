@@ -661,6 +661,7 @@ mod tests {
         ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
         let texts = [
             ("Korean", "한국어 사용자"),
+            ("Georgian", "ქართული ენა"),
             ("Chinese", "你好，世界"),
             ("Japanese", "こんにちは、カタカナ"),
             ("Thai", "ภาษาไทย"),
