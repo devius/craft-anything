@@ -19,6 +19,10 @@ fn cfg(name: &str, kind: BackendKind, model: &str) -> BackendConfig {
     BackendConfig { name: name.into(), kind, model: model.into(), base_url: None, ssh_host: None, enabled: true }
 }
 
+fn cfg_at(name: &str, kind: BackendKind, model: &str, base: &str) -> BackendConfig {
+    BackendConfig { base_url: Some(base.into()), ..cfg(name, kind, model) }
+}
+
 /// Environment keys that are set.
 pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
     let mut out = Vec::new();
@@ -29,6 +33,17 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
     ] {
         if get(var).is_some_and(|v| !v.trim().is_empty()) {
             out.push(Detected { suggestion: cfg(name, kind, model), reason: format!("Found {var} in your environment"), needs_key: false });
+        }
+    }
+    // Hosted APIs we know by name. Offered only when their key is already set, like OpenAI and
+    // Anthropic, so a paid service is never advertised to someone who has no key for it.
+    for p in crate::providers::PROVIDERS {
+        if let Some(var) = p.key_names().find(|var| get(var).is_some_and(|v| !v.trim().is_empty())) {
+            out.push(Detected {
+                suggestion: cfg_at(p.name, p.kind, p.default_model, p.base_url),
+                reason: format!("Found {var} in your environment"),
+                needs_key: false,
+            });
         }
     }
     // A Google AI Studio key is free and the easiest one to get (#646): always offered, found or pasted.
@@ -53,6 +68,16 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
         },
         needs_key: !found,
     });
+    // OpenCode Go: a paid subscription, so it is offered only when its key is already set. Gemini
+    // and Kimi are offered keyless because they are general model APIs.
+    let go = ["OPENCODEGO_API_KEY", "OPENCODE_GO_API_KEY"].iter().any(|v| get(v).is_some_and(|k| !k.trim().is_empty()));
+    if go {
+        out.push(Detected {
+            suggestion: cfg_at(OPENCODE_GO_NAME, BackendKind::OpenaiCompatible, crate::openai::OPENCODE_GO_DEFAULT_MODEL, crate::openai::OPENCODE_GO_BASE),
+            reason: "OpenCode Go, with its key in your environment".into(),
+            needs_key: false,
+        });
+    }
     out
 }
 
@@ -60,6 +85,9 @@ pub fn env_keys(get: impl Fn(&str) -> Option<String>) -> Vec<Detected> {
 pub const KIMI_NAME: &str = "Kimi K3.1 Pro (OpenRouter)";
 /// Name given to a Google AI Studio (Gemini API key) backend.
 pub const GEMINI_NAME: &str = "Gemini (Google AI Studio)";
+
+/// The name OpenCode Go is added under.
+pub const OPENCODE_GO_NAME: &str = "OpenCode Go (subscription)";
 
 /// Is something listening at this URL's host:port? (bounded TCP connect)
 pub fn port_open(base_url: &str, timeout: Duration) -> bool {
@@ -120,13 +148,77 @@ pub fn agent_clis() -> Vec<Detected> {
     crate::cli_agents::KNOWN
         .iter()
         .filter_map(|(id, prog, display)| {
-            craft_anything_platform::which(prog).map(|p| Detected {
+            crate::cli_agents::find_program(prog).map(|p| Detected {
                 suggestion: cfg(display, BackendKind::AgentCli, id),
                 reason: format!("Found {display} at {}", p.display()),
                 needs_key: false,
             })
         })
         .collect()
+}
+
+/// What a scan found that isn't an AI to use but explains why one is missing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DetectHint {
+    /// The Claude desktop app is installed, but not Claude Code, the `claude` command builds run:
+    /// "Claude" installed from its website wasn't found and nothing said why (#259).
+    ClaudeDesktopWithoutCli { app: PathBuf },
+}
+
+impl DetectHint {
+    pub fn message(&self) -> String {
+        match self {
+            Self::ClaudeDesktopWithoutCli { app } => {
+                format!("The Claude desktop app is installed ({}), but Claude Code, the `claude` command-line tool building uses, isn't.", app.display())
+            }
+        }
+    }
+
+    pub fn remediation(&self) -> &'static str {
+        match self {
+            Self::ClaudeDesktopWithoutCli { .. } => "Install Claude Code apart from the desktop app, sign in to it once in a terminal, then look again.",
+        }
+    }
+}
+
+/// Hints for what [`agent_clis`] can't offer.
+pub fn hints() -> Vec<DetectHint> {
+    if crate::cli_agents::find_program("claude").is_some() {
+        return Vec::new();
+    }
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let local_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    claude_desktop_app(home.as_deref(), local_data.as_deref()).map(|app| DetectHint::ClaudeDesktopWithoutCli { app }).into_iter().collect()
+}
+
+/// The Claude desktop app's Store package family (name and publisher id), whose folder Windows
+/// makes under `%LOCALAPPDATA%\Packages` for each person it's installed for.
+const CLAUDE_STORE_PACKAGE: &str = "Claude_pzs8sxrjxfjjc";
+
+/// Where the Claude desktop app is, if it's installed. On Windows the Store package leaves a
+/// `claude-desktop` app alias (a link that only `symlink_metadata` can read), or, with its app
+/// aliases turned off, only its package folder; the older installer leaves an `AnthropicClaude`
+/// folder. On macOS it's `Claude.app`. There's no Linux app.
+fn claude_desktop_app(home: Option<&std::path::Path>, local_data: Option<&std::path::Path>) -> Option<PathBuf> {
+    let places: Vec<PathBuf> = if cfg!(windows) {
+        let local_data = local_data.map(PathBuf::from).or_else(|| home.map(|h| h.join("AppData").join("Local")));
+        local_data
+            .into_iter()
+            .flat_map(|d| {
+                [
+                    d.join("Microsoft").join("WindowsApps").join("claude-desktop.exe"),
+                    d.join("AnthropicClaude").join("claude.exe"),
+                    d.join("Packages").join(CLAUDE_STORE_PACKAGE),
+                ]
+            })
+            .collect()
+    } else if cfg!(target_os = "macos") {
+        std::iter::once(PathBuf::from("/Applications/Claude.app")).chain(home.map(|h| h.join("Applications").join("Claude.app"))).collect()
+    } else {
+        Vec::new()
+    };
+    places.into_iter().find(|p| std::fs::symlink_metadata(p).is_ok())
 }
 
 /// The most servers taken from OpenCode's settings.
@@ -295,6 +387,39 @@ mod model_id_tests;
 mod tests {
     use super::*;
 
+    /// #259: the desktop app is found where its installers put it, and nothing is made up where
+    /// there's none.
+    #[test]
+    fn the_claude_desktop_app_is_found_where_its_installers_put_it() {
+        let empty = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("AnthropicClaude").join("claude.exe");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, b"app").unwrap();
+        let mac = dir.path().join("Applications").join("Claude.app");
+        std::fs::create_dir_all(&mac).unwrap();
+        let found = claude_desktop_app(Some(dir.path()), Some(dir.path()));
+        if cfg!(windows) {
+            assert_eq!(found, Some(app));
+            assert_eq!(claude_desktop_app(Some(empty.path()), Some(empty.path())), None);
+            // The Store package's alias wins over an old install.
+            let alias = dir.path().join("Microsoft").join("WindowsApps").join("claude-desktop.exe");
+            std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            std::fs::write(&alias, b"").unwrap();
+            assert_eq!(claude_desktop_app(None, Some(dir.path())), Some(alias));
+            // A Store install whose app aliases are turned off leaves only its package folder.
+            let store = tempfile::tempdir().unwrap();
+            let package = store.path().join("Packages").join(CLAUDE_STORE_PACKAGE);
+            std::fs::create_dir_all(&package).unwrap();
+            assert_eq!(claude_desktop_app(None, Some(store.path())), Some(package));
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(found, None, "there's no Claude desktop app for Linux");
+        }
+        let hint = DetectHint::ClaudeDesktopWithoutCli { app: PathBuf::from("Claude") };
+        assert!(hint.message().contains("desktop app") && hint.message().contains("`claude`"), "{}", hint.message());
+        assert_eq!(serde_json::to_value(&hint).unwrap()["kind"], "claude_desktop_without_cli");
+    }
+
     /// Non-Git SSH hosts offer both supported agent suggestions without probing the remote computer.
     #[test]
     fn ssh_hosts_offer_opencode_as_well_as_claude_code() {
@@ -308,18 +433,32 @@ mod tests {
     #[test]
     fn env_detection() {
         let d = env_keys(|v| (v == "OPENROUTER_API_KEY").then(|| "k".to_string()));
-        assert_eq!(d.len(), 3);
-        assert_eq!(d[0].suggestion.kind, BackendKind::Openrouter);
-        assert!(d[0].reason.contains("OPENROUTER_API_KEY"));
+        let find = |name: &str| d.iter().find(|x| x.suggestion.name == name).unwrap_or_else(|| panic!("{name} offered"));
+        assert!(find("OpenRouter").reason.contains("OPENROUTER_API_KEY"));
         // Gemini is always offered; without its key it asks for one.
-        assert!(d[1].suggestion.kind == BackendKind::Gemini && d[1].needs_key);
-        // Kimi K3.1 Pro rides on the same key, so it needs none of its own.
-        assert_eq!((d[2].suggestion.model.as_str(), d[2].needs_key), (crate::openai::KIMI_K3_1, false));
-        // Without a key, Gemini and Kimi K3.1 Pro are still offered, asking for one.
+        assert!(find(GEMINI_NAME).needs_key);
+        // Kimi K3.1 Pro rides on the OpenRouter key, so it needs none of its own.
+        assert!(!find(KIMI_NAME).needs_key);
+        // A paid subscription is not advertised to someone who has no key for it.
+        assert!(d.iter().all(|x| x.suggestion.name != OPENCODE_GO_NAME));
+        // Without any key, everything that can be pasted is still offered.
         let none = env_keys(|_| Some("  ".into()));
-        assert_eq!(none.len(), 2);
-        assert!(none[0].needs_key && none[0].suggestion.name == GEMINI_NAME);
-        assert!(none[1].needs_key && none[1].suggestion.name == KIMI_NAME);
+        assert!(none.iter().all(|x| x.needs_key));
+        for name in [GEMINI_NAME, KIMI_NAME] {
+            assert!(none.iter().any(|x| x.suggestion.name == name), "{name} offered");
+        }
+    }
+
+    /// OpenCode Go is offered when its key is set, under either of its environment names.
+    #[test]
+    fn opencode_go_is_offered_only_with_its_key() {
+        for var in ["OPENCODEGO_API_KEY", "OPENCODE_GO_API_KEY"] {
+            let d = env_keys(|v| (v == var).then(|| "k".to_string()));
+            let go = d.iter().find(|x| x.suggestion.name == OPENCODE_GO_NAME).expect("OpenCode Go offered");
+            assert!(!go.needs_key);
+            assert_eq!(go.suggestion.base_url.as_deref(), Some(crate::openai::OPENCODE_GO_BASE));
+            assert_eq!(go.suggestion.model.as_str(), crate::openai::OPENCODE_GO_DEFAULT_MODEL);
+        }
     }
 
     #[test]
@@ -331,13 +470,24 @@ mod tests {
         assert!(BackendKind::Gemini.needs_key());
     }
 
+    /// A named provider is offered when its key is set, with its own base URL and default model.
+    #[test]
+    fn a_provider_key_offers_that_provider() {
+        let d = env_keys(|v| (v == "MOONSHOT_API_KEY").then(|| "k".to_string()));
+        let p = d.iter().find(|x| x.suggestion.name == "Moonshot").expect("Moonshot offered");
+        assert!(!p.needs_key);
+        assert!(p.reason.contains("MOONSHOT_API_KEY"));
+        assert_eq!(p.suggestion.base_url.as_deref(), Some("https://api.moonshot.ai/v1"));
+        assert_eq!(p.suggestion.model.as_str(), "kimi-k3.1-pro");
+        // A key that nobody has does not add a row.
+        assert!(d.iter().all(|x| x.suggestion.name != "DeepSeek"));
+    }
+
     #[test]
     fn closed_port_is_fast_and_negative() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
+        // Binding port 0 chooses a nonzero port, so no listener can take this endpoint.
         let t = Instant::now();
-        assert!(probe_local("X", &format!("http://127.0.0.1:{port}/v1")).is_none());
+        assert!(probe_local("X", "http://127.0.0.1:0/v1").is_none());
         assert!(t.elapsed() < Duration::from_secs(1));
     }
 

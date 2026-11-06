@@ -80,6 +80,31 @@ fn a_tools_own_project_option_reaches_the_tool() {
     assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 0, "no investigation was created in the folder");
 }
 
+/// A builder that runs our CLI from its shell is an agent to the tools, so it can't allow itself to
+/// push; the person, running the same command, can.
+#[test]
+fn the_cli_inside_an_agent_cant_loosen_a_projects_approvals() {
+    use craft_anything_engine::workspace::{ActionKind, Approval, TargetRef, Workspace};
+    let cfg = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(dir.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    let project = ws.root.to_str().unwrap().to_string();
+    let args = ["project-approvals-set", "--project", project.as_str(), "--kind", "publish", "--mode", "allow"];
+    let run = |agent: bool| {
+        let p = Process::new(env!("CARGO_BIN_EXE_craft-anything-cli")).args(args).env("CRAFT_ANYTHING_CONFIG_DIR", cfg.path());
+        let p = if agent { p.env(craft_anything_engine::AGENT_ENV, "1") } else { p };
+        p.timeout(Duration::from_secs(60)).run().unwrap()
+    };
+    let saved = || Workspace::open(&ws.root).unwrap().manifest.approvals.get(&ActionKind::Publish).copied();
+    let refused = run(true);
+    assert!(!refused.success, "{}", refused.stdout_text());
+    assert!(refused.stdout_text().contains("can't loosen"), "{}", refused.stdout_text());
+    assert_eq!(saved(), None, "nothing changed");
+    let allowed = run(false);
+    assert!(allowed.success, "{}{}", allowed.stdout_text(), allowed.stderr_text());
+    assert_eq!(saved(), Some(Approval::Allow));
+}
+
 #[test]
 fn target_tools_open_then_close_and_project_journal() {
     let cfg = tempfile::tempdir().unwrap();
@@ -138,6 +163,31 @@ fn mcp_over_stdio() {
     assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "craft-anything");
     assert!(by_id(2)["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "core_session_show"));
     assert_eq!(by_id(3)["result"]["isError"], false);
+}
+
+#[test]
+fn mcp_restores_the_desktop_target_before_listing_tools() {
+    use craft_anything_engine::target::{Target, TargetContext};
+    let config = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("shared.bin");
+    std::fs::write(&file, b"shared-target").unwrap();
+    let target = Target::load(&file).unwrap();
+    let context = serde_json::to_string(&TargetContext::from_target(&target)).unwrap();
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"core_targets_list","arguments":{}}}),
+    ].iter().map(|message| format!("{message}\n")).collect::<String>();
+    for mode in ["--deep", "--clean-room"] {
+        let output = cli_with_stdin(&["mcp", mode, "--target", &context], config.path(), input.as_bytes());
+        assert!(output.success, "{}", output.stderr_text());
+        let messages: Vec<Value> = output.stdout_text().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let response = messages.iter().find(|message| message["id"] == 2).unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let value: Value = serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(value["result"]["targets"][0]["target_id"], target.id, "{value}");
+    }
 }
 
 #[test]
@@ -239,4 +289,45 @@ fn help_does_not_advise_a_report_format_option() {
     assert!(help.success);
     assert!(!help.stdout_text().contains("(core-target-open, report"));
     assert_eq!(cli(&["report", "--format", "html"], cfg.path()).code, Some(2));
+}
+
+/// #855, #856: CLI mcp --restricted omits machine and web tools, and refuses web_site_open.
+#[test]
+fn mcp_restricted_mode_cli() {
+    let cfg = tempfile::tempdir().unwrap();
+    let input = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "web_site_open", "arguments": {"url": "https://example.com"}}}),
+    ]
+    .iter()
+    .map(|v| format!("{v}\n"))
+    .collect::<String>();
+
+    let out = Process::new(env!("CARGO_BIN_EXE_craft-anything-cli"))
+        .arg("mcp")
+        .arg("--restricted")
+        .arg("--all-tools")
+        .env("CRAFT_ANYTHING_CONFIG_DIR", cfg.path())
+        .stdin_bytes(input)
+        .timeout(Duration::from_secs(30))
+        .run()
+        .unwrap();
+    assert!(out.success, "{}", out.stderr_text());
+    let msgs: Vec<Value> = out.stdout_text().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let by_id = |id: u64| msgs.iter().find(|m| m["id"] == json!(id)).unwrap().clone();
+
+    // Tools list omits machine tools and web tools
+    let tools = by_id(2)["result"]["tools"].as_array().unwrap().clone();
+    assert!(!tools.iter().any(|t| t["name"] == "web_site_open"));
+    assert!(!tools.iter().any(|t| t["name"] == "web_site_capture"));
+    assert!(!tools.iter().any(|t| t["name"] == "build_command_run"));
+    assert!(tools.iter().any(|t| t["name"] == "core_session_show"));
+
+    // tools/call web_site_open is refused
+    let call_res = by_id(3)["result"].clone();
+    assert_eq!(call_res["isError"], true);
+    let err_obj: Value = serde_json::from_str(call_res["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(err_obj["error"]["message"].as_str().unwrap().contains("turned off in restricted mode"));
 }

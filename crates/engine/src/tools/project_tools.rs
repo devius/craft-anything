@@ -5,7 +5,7 @@
 use crate::feed;
 use crate::inbox::{Answer, Inbox};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
-use crate::workspace::Workspace;
+use crate::workspace::{ACTION_KINDS, ActionKind, Approval, Workspace};
 use craft_anything_evidence::{ErrorCode, ToolError};
 use craft_anything_platform::sync::Mutex;
 use schemars::JsonSchema;
@@ -98,6 +98,17 @@ pub fn specs() -> Vec<ToolSpec> {
             run: project_rename,
         },
         ToolSpec {
+            id: "project_plan_fold",
+            title: "Fold a project's plan",
+            summary: "Fold the builder's plan card away (#504). The steps stay in the project's conversation, and a later run's plan shows again. Call it between builds: a build saves its conversation as it goes, so a fold made during one can be overwritten by that build's next save.",
+            beginner: "Hides the builder's checklist until it makes a new one.",
+            toolset: Toolset::Projects,
+            effects: Effects::WRITES_FILESYSTEM,
+            requires: Requires::Nothing,
+            input_schema: schema_of::<FoldPlanParams>,
+            run: project_plan_fold,
+        },
+        ToolSpec {
             id: "project_duplicate",
             title: "Duplicate a project",
             summary: "Copy a project beside it under a new name, to try something else from where it is: what was built, the pictures of the original and the study come along; the conversation, questions and usage don't, and neither do dependencies or compiler output (the next build makes them again). An app edited in place is copied into the copy's app/ folder.",
@@ -129,6 +140,17 @@ pub fn specs() -> Vec<ToolSpec> {
             requires: Requires::Nothing,
             input_schema: schema_of::<QuestionsParams>,
             run: project_questions_set,
+        },
+        ToolSpec {
+            id: "project_approvals_set",
+            title: "Choose what the builder's approvals get",
+            summary: "Choose, for one kind of builder action in a project, whether it goes ahead (`allow`), waits for the person's OK on a card (`ask`) or is refused (`refuse`); `default` follows Auto mode. Kinds: `web` (reading websites, searching), `commands` (outside the usual build commands), `outside_files` (changing files outside the project), `publish` (git push, npm publish, gh pr create…), `delete_outside`, `system` (system changes and files, Craft Anything's own records), `other_tools`. With no kind, says what every kind gets now. Takes effect from the builder's next action, also mid-build. Only the person changes these: an agent's call may only make a kind stricter.",
+            beginner: "Chooses what the builder may do without asking you.",
+            toolset: Toolset::Projects,
+            effects: Effects::WRITES_FILESYSTEM,
+            requires: Requires::Nothing,
+            input_schema: schema_of::<ApprovalsParams>,
+            run: project_approvals_set,
         },
         ToolSpec {
             id: "project_build_finish",
@@ -180,6 +202,21 @@ fn project_rename(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolE
     let mut ws = open(&p.project)?;
     ws.rename(&p.name)?;
     Ok(ToolOutput::Value(json!({"project": ws.root, "name": ws.manifest.name})))
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FoldPlanParams {
+    /// The project's folder.
+    pub project: PathBuf,
+}
+
+fn project_plan_fold(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: FoldPlanParams = parse_params(params)?;
+    let ws = open(&p.project)?;
+    // `folded` is false when there's no plan to fold, or it's folded already.
+    let folded = crate::feed::dismiss_plan_saved(&ws)?;
+    Ok(ToolOutput::Value(json!({"project": ws.root, "folded": folded})))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -356,6 +393,86 @@ fn project_questions_set(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
         "chosen": ws.manifest.questions,
         "app_default": settings.questions(),
     })))
+}
+
+/// What one kind of a project's builder actions should get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalChoice {
+    Allow,
+    Ask,
+    Refuse,
+    /// What Auto mode gives it.
+    Default,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalsParams {
+    /// The project's folder.
+    pub project: PathBuf,
+    /// The kind of action (`publish`, `web`…); none just reads what every kind gets.
+    #[serde(default)]
+    pub kind: Option<ActionKind>,
+    /// `allow`, `ask`, `refuse` or `default`; needed with `kind`.
+    #[serde(default)]
+    pub mode: Option<ApprovalChoice>,
+}
+
+fn project_approvals_set(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: ApprovalsParams = parse_params(params)?;
+    let mut ws = open(&p.project)?;
+    let auto_mode = ctx.session.settings.auto_mode;
+    let mut set = None;
+    match (p.kind, p.mode) {
+        (Some(kind), Some(mode)) => {
+            set = Some(kind);
+            let chosen = match mode {
+                ApprovalChoice::Allow => Some(Approval::Allow),
+                ApprovalChoice::Ask => Some(Approval::Ask),
+                ApprovalChoice::Refuse => Some(Approval::Refuse),
+                ApprovalChoice::Default => None,
+            };
+            // A builder (or any agent) can't let itself do more: what it's held to is the person's
+            // to loosen, from the app or the CLI. Checked with Auto mode on and off, so switching it
+            // later doesn't hand over what the agent changed (an unchosen kind set to its default
+            // now, or a refusal given back to a default that asks).
+            let agent = matches!(ctx.caller, crate::Caller::Mcp | crate::Caller::Agent);
+            let looser = [true, false]
+                .into_iter()
+                .any(|auto| chosen.unwrap_or_else(|| kind.default_in(auto)).strictness() < ws.manifest.approval(kind, auto).strictness());
+            if agent && looser {
+                return Err(ToolError::new(ErrorCode::NoPermission, format!("An agent can't loosen what \"{}\" gets in this project.", kind.name()))
+                    .with_remediation("Ask the person to change it in the app (the project's approvals) or with the CLI."));
+            }
+            ws.set_person(|m| match chosen {
+                Some(a) => {
+                    m.approvals.insert(kind, a);
+                }
+                None => {
+                    m.approvals.remove(&kind);
+                }
+            })?;
+        }
+        (Some(_), None) => return Err(ToolError::invalid("mode is needed with kind: allow, ask, refuse or default")),
+        (None, Some(_)) => return Err(ToolError::invalid("kind is needed with mode")),
+        (None, None) => {}
+    }
+    let kinds: Vec<Value> = ACTION_KINDS
+        .iter()
+        .map(|r| {
+            json!({
+                "kind": r.kind,
+                "what": r.what,
+                "gets": ws.manifest.approval(r.kind, auto_mode),
+                "chosen": ws.manifest.approvals.get(&r.kind),
+                "default": r.kind.default_in(auto_mode),
+            })
+        })
+        .collect();
+    // The kind just set and what it gets now, so a client can say what changed.
+    let set = set.map(|k| json!({"kind": k, "gets": ws.manifest.approval(k, auto_mode), "chosen": ws.manifest.approvals.get(&k)}));
+    Ok(ToolOutput::Value(json!({"project": ws.root, "auto_mode": auto_mode, "set": set, "kinds": kinds})))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -622,6 +739,22 @@ mod tests {
         assert_eq!(call(json!({"project": ws.root, "budget_usd": 12.5})).unwrap()["budget_usd"], 12.5);
         assert_eq!(Workspace::open(&ws.root).unwrap().manifest.asset_budget_usd, 12.5);
         assert!(call(json!({"project": ws.root, "budget_usd": -1})).is_err());
+    }
+
+    /// #504: the plan card is folded by a tool too (the app's button calls it), and says whether
+    /// it folded anything.
+    #[test]
+    fn a_plan_is_folded_by_its_tool_and_says_whether_it_did() {
+        use crate::feed::{FeedItem, PlanStep, UserItem, save, visible_plan};
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Game", "A game", TargetRef::None).unwrap();
+        let steps = vec![PlanStep { text: "Lay out".into(), doing: "Laying out".into(), status: crate::feed::PlanStatus::Todo }];
+        save(&ws.root, &[FeedItem::User(UserItem::Text("A game".into())), FeedItem::Plan(steps)]).unwrap();
+        let e = Engine::new(crate::testing::session());
+        let fold = || e.call("project_plan_fold", json!({"project": ws.root}), CallOptions::new(Caller::Cli)).map(|o| o.to_json()["result"]["folded"].clone());
+        assert_eq!(fold().unwrap(), true);
+        assert!(visible_plan(&crate::feed::load(&ws)).is_none());
+        assert_eq!(fold().unwrap(), false, "already folded");
     }
 
     #[test]

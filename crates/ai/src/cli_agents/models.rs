@@ -106,7 +106,7 @@ pub(crate) fn query_args(options: &BackendOptions) -> Result<Vec<String>, ToolEr
 /// Select the configured executable and catalogue location, quoting SSH arguments for the remote shell.
 /// Local queries use the supplied directory or current directory; SSH queries expand remote `$PWD`.
 fn query_command(config: &BackendConfig, options: &BackendOptions, directory: Option<&Path>) -> Result<(String, Vec<String>), ToolError> {
-    let program = options.command.clone().unwrap_or_else(|| super::program_for(&config.model));
+    let program = super::program_of(config, options)?;
     let mut args = query_args(options)?;
     match config.ssh_host.as_deref().filter(|h| !h.trim().is_empty()) {
         Some(host) => {
@@ -154,11 +154,11 @@ pub(crate) fn discover(config: &BackendConfig, options: &BackendOptions, directo
 /// Validate explicit selections against the current instance before saving or starting a run.
 pub(crate) fn validate(options: &BackendOptions, models: &[AgentModel]) -> Result<(), ToolError> {
     let Some(id) = options.cli_model.as_deref() else {
-        return if options.cli_thinking.is_none() { Ok(()) } else { Err(ToolError::invalid("Choose an OpenCode model before choosing its thinking depth.")) };
+        return if options.cli_thinking.is_none() { Ok(()) } else { Err(ToolError::invalid("Choose a model before choosing its thinking depth.")) };
     };
     let Some(model) = models.iter().find(|m| m.id == id) else {
-        return Err(ToolError::invalid(format!("The selected OpenCode model {id:?} is no longer available."))
-            .with_remediation("Reload the models on this computer and choose an available model or the OpenCode default."));
+        return Err(ToolError::invalid(format!("The selected model {id:?} is no longer available."))
+            .with_remediation("Reload the models on this computer and choose an available model or the agent's default."));
     };
     if let Some(depth) = options.cli_thinking.filter(|d| !model.thinking.contains(d)) {
         return Err(ToolError::invalid(format!("{} does not offer {} thinking.", model.id, depth.title()))
@@ -183,6 +183,13 @@ pub fn select_with_stop(context: &ModelContext, model: Option<&str>, thinking: O
     let mut options = context.backend.options.clone();
     options.cli_model = model.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     options.cli_thinking = thinking;
+    if adapter.requires_acp() {
+        options.cli_reasoning_effort = None;
+        options.effort = None;
+        if options.cli_model != context.backend.options.cli_model {
+            options.cli_context = None;
+        }
+    }
     adapter.validate_model(&context.backend.config, &options, context.directory.as_deref(), stop)?;
     Ok(options)
 }
@@ -270,9 +277,16 @@ mod tests {
             args.last().unwrap(),
             "'/opt/agent'\\''s tools/opencode' api model.list --server http://localhost:4096 --param \"location[directory]=$PWD\""
         );
+        // Locally a chosen path must exist: a missing one falls back to an installed `opencode`.
         cfg.ssh_host = None;
+        let folder = tempfile::tempdir().unwrap();
+        let chosen = folder.path().join("agent's tools").join("opencode");
+        std::fs::create_dir_all(chosen.parent().unwrap()).unwrap();
+        std::fs::write(&chosen, b"").unwrap();
+        let chosen = chosen.display().to_string();
+        let options = BackendOptions { command: Some(chosen.clone()), ..options };
         let (program, args) = query_command(&cfg, &options, Some(Path::new("/work/test"))).unwrap();
-        assert_eq!(program, "/opt/agent's tools/opencode");
+        assert_eq!(program, chosen);
         assert_eq!(args, ["api", "model.list", "--server", "http://localhost:4096", "--param", "location[directory]=/work/test"]);
     }
 
@@ -292,6 +306,8 @@ mod tests {
         let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
         let (_, args) = query_command(&cfg, &options, Some(Path::new("/local/ignored"))).unwrap();
         let output = Process::new("sh").arg("-c").arg(args.last().unwrap()).cwd(&remote).timeout(Duration::from_secs(2)).run_checked().unwrap();
+        // The shell resolves aliases in its working directory (macOS /var points to /private/var).
+        let remote = remote.canonicalize().unwrap();
         assert_eq!(output.stdout_text().lines().collect::<Vec<_>>(), ["api", "model.list", "--param", &format!("location[directory]={}", remote.display())]);
     }
 

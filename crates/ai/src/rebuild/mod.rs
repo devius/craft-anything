@@ -246,13 +246,14 @@ impl RebuildRun {
             editor: None,
             notes: notes.clone(),
             feed: feed.clone(),
-            assets: hub.has_asset_keys(),
+            assets: false,
             decompiled: false,
             usage: Some(UsageClock { root: root.clone(), since: Instant::now() }),
             self_check: None,
             reset_progress_after_notes: false,
         };
         let r2 = running.clone();
+        let key_store = hub.keys.clone();
         std::thread::Builder::new()
             .name("rebuild".into())
             .spawn(move || {
@@ -261,7 +262,10 @@ impl RebuildRun {
                 // A clone can run for hours: keep the computer from sleeping until it ends.
                 let awake = craft_anything_platform::keep_awake();
                 let _here = self_check::BuildingHere::new(&ws.root);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.run(&mut ws, entry, api, extractor, &opts)));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ctx.load_asset_keys(&key_store);
+                    ctx.run(&mut ws, entry, api, extractor, &opts)
+                }));
                 let (ok, message, paused) = match result {
                     Ok(Ok(m)) => (true, m, false),
                     Ok(Err(e)) if e.code == ErrorCode::Cancelled => {
@@ -444,6 +448,15 @@ struct UsageClock {
 /// How often a long agent turn saves the time worked so far, so a crash loses little of it.
 const USAGE_FLUSH: Duration = Duration::from_secs(60);
 
+/// Record `e` in the feed, send it and wake the window, under one lock.
+fn emit_event(feed: &Mutex<feed::FeedLog>, tx: &Sender<RunEvent>, wake: &Wake, e: RunEvent) {
+    let mut feed = feed.lock().unwrap_or_else(PoisonError::into_inner);
+    feed.record(&e);
+    let _ = tx.send(e);
+    drop(feed);
+    wake.call();
+}
+
 impl Worker {
     /// Add the time worked since the last record (and an agent turn's tokens and reported cost)
     /// to the project's usage.json. The run is its only writer; a failure is logged and the build
@@ -465,11 +478,7 @@ impl Worker {
 
     /// Recorded and sent under one lock, so [`RebuildRun::feed_now`] sees each event once.
     fn emit(&self, e: RunEvent) {
-        let mut feed = self.feed.lock().unwrap_or_else(PoisonError::into_inner);
-        feed.record(&e);
-        let _ = self.tx.send(e);
-        drop(feed);
-        self.wake.call();
+        emit_event(&self.feed, &self.tx, &self.wake, e);
     }
 
     fn step(&self, ws: &mut Workspace, step: Step, status: Status, text: &str) -> Result<(), ToolError> {
@@ -489,6 +498,21 @@ impl Worker {
         let result = self.engine.call(tool, params, opts);
         self.emit(RunEvent::Agent(AgentEvent::ToolFinished { call_id, tool: tool.to_string(), ok: result.is_ok(), summary: String::new(), evidence_id: None }));
         result
+    }
+
+    /// An API backend's builder runs its tools in this session, not in a tool server that loads the
+    /// keys itself (#923). Read on the worker because the keychain can block, and for each run so a
+    /// key saved outside the app since the last one counts. The session stays held through the
+    /// read, so a key removed meanwhile can't be put back by keys read before it went. What the
+    /// brief says about assets comes from the same read, so the two agree.
+    fn load_asset_keys(&mut self, store: &crate::KeyStore) {
+        let mut session = self.engine.session();
+        session.label("Load the asset keys");
+        let providers = session.ext.get::<craft_anything_engines::assets::AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
+        let keys = crate::keys::asset_keys(store, &providers);
+        // The brief offers the built-in models, so a key for another provider doesn't count.
+        self.assets = craft_anything_engines::assets::AssetProviders::built_in().ids().into_iter().any(|id| keys.get(id).is_some());
+        session.ext.insert(Arc::new(keys));
     }
 
     /// Point the engine at this workspace: its investigation project and inbox.
@@ -565,13 +589,14 @@ impl Worker {
     /// How the builder's agent runs. Reads the session once: a lock taken twice in one statement
     /// is held by the first until the statement ends, and the second then waits forever.
     fn agent_spec(&self, ws: &Workspace, entry: &crate::BackendEntry, opts: &RunOptions) -> CliSpec {
-        let (deep, config_dir) = {
+        let (deep, config_dir, targets) = {
             let session = self.engine.session();
-            (!session.clean_room(), session.config_dir())
+            (!session.clean_room(), session.config_dir(), session.shared_targets())
         };
         CliSpec {
             builder: Some(Builder { investigation: Some(ws.investigation_dir()), inbox: ws.inbox_dir() }),
             deep,
+            targets,
             logs: Some(crate::failure_log::dir_in(&config_dir)),
             resume: ws.manifest.agent_session.clone(),
             preamble: Some(
@@ -608,15 +633,19 @@ impl Worker {
             progress.save(&ws.root)?;
         }
         // Fail before any work when the agent's tools are missing or it can't sign in.
-        let remote = entry.config.ssh_host.as_deref().is_some_and(|h| !h.trim().is_empty());
-        if !remote && api.is_none() {
-            let adapter = opts.adapters.for_agent(&entry.config.model);
-            crate::cli_agents::check_builder_tools(adapter.as_ref(), &entry.config.model, &entry.options, &self.stop)?;
-            let program = entry.options.command.clone().unwrap_or_else(|| crate::cli_agents::program_for(&entry.config.model));
-            if adapter.signed_in(&program) == Some(false) {
-                let who = crate::cli_agents::display_for(&entry.config.model);
-                return Err(ToolError::new(ErrorCode::BadSettings, format!("{who} isn't signed in on this computer."))
-                    .with_remediation(adapter.sign_in_fix().unwrap_or_default()));
+        let remote_host = entry.config.ssh_host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+        let remote = remote_host.is_some();
+        if api.is_none() {
+            let adapter = opts.adapters.for_backend(&entry.config.model, &entry.options);
+            if let Some(host) = remote_host {
+                adapter.check_remote_tool_server(host, &self.stop)?;
+            } else {
+                crate::cli_agents::check_builder_tools(adapter.as_ref(), &entry.config.model, &entry.options, &self.stop)?;
+                let program = crate::cli_agents::program_of(&entry.config, &entry.options)?;
+                if adapter.signed_in(&program) == Some(false) {
+                    return Err(ToolError::new(ErrorCode::BadSettings, not_signed_in(&entry.config.model, adapter.signed_in_before()))
+                        .with_remediation(adapter.sign_in_fix().unwrap_or_default()));
+                }
             }
         }
         self.attach(ws)?;
@@ -627,8 +656,7 @@ impl Worker {
         };
         if ws.manifest.stack.is_empty() {
             let deep = !self.engine.session().clean_room();
-            let (_, stack) = opts.kinds.choose(&ws.manifest.request, &ws.manifest.target, deep).ok_or_else(no_kind)?;
-            ws.manifest.stack = stack.to_string();
+            ws.manifest.stack = project::first_stack(&opts.kinds, ws, deep).ok_or_else(no_kind)?.to_string();
             ws.save()?;
         }
         let kind = opts.kinds.detect(&ws.manifest.request, &ws.manifest.target, &ws.manifest.stack).ok_or_else(no_kind)?;
@@ -653,7 +681,7 @@ impl Worker {
             ws.save()?;
         }
         // A coding agent on this computer whose session the project keeps a copy of (#451).
-        let keeper = (!api_loop && !remote).then(|| opts.adapters.for_agent(&entry.config.model));
+        let keeper = (!api_loop && !remote).then(|| opts.adapters.for_backend(&entry.config.model, &entry.options));
         if let Some(a) = &keeper {
             self.restore_session(ws, a.as_ref());
         }
@@ -694,7 +722,23 @@ impl Worker {
             let handoff = keeper.as_ref().and_then(|a| a.handoff(&kept_session(ws)?, HANDOFF_CHARS));
             resumed_elsewhere(&brief(kind, &cx, opts.message.as_deref()), &ws.manifest.last_reply, handoff.as_deref())
         });
+        // "Just ask" runs apart from the builder's session, and the person's message may follow on from it (#857).
+        let new_request = opts.message.as_deref().is_some_and(|m| !m.trim().is_empty());
+        let mut asked = if new_request { craft_anything_engine::questions::untold(ws, deep) } else { Vec::new() };
+        let just_asked = just_asked(&asked);
+        prompt.insert_str(0, &just_asked);
+        fresh = fresh.map(|f| format!("{just_asked}{f}"));
         let mut round = ws.manifest.checks.iter().map(|c| c.round).max().unwrap_or(0);
+        // A new request starts the count of checks that found no working build again. "Try again" on
+        // a build that already reached the limit stops before another builder turn is paid for (#736).
+        if opts.message.is_some() {
+            if ws.manifest.not_working_checks != 0 {
+                ws.manifest.not_working_checks = 0;
+                ws.save()?;
+            }
+        } else if ws.manifest.not_working_checks >= NOT_WORKING_CHECK_LIMIT {
+            return Err(not_working(ws));
+        }
         let mut refinements = 0;
         // Deep mode on a program: decompiling is required, so a build turn without any gets one reminder.
         let must_decompile = !self.engine.session().clean_room() && matches!(ws.manifest.target, TargetRef::Local { .. });
@@ -741,6 +785,14 @@ impl Worker {
                         return Err(error);
                     }
                 };
+                // Only a finished turn counts: telling the builder twice costs little, and a turn that
+                // failed may not have told it at all.
+                let told = std::mem::take(&mut asked);
+                if !told.is_empty()
+                    && let Err(e) = craft_anything_engine::questions::mark_told(ws, &told)
+                {
+                    log::warn!("couldn't record which questions the builder was told: {}", e.message);
+                }
                 if !reply.trim().is_empty() {
                     ws.manifest.last_reply = reply.trim().to_string();
                 }
@@ -767,6 +819,7 @@ impl Worker {
                 if let Some(p) = self.added(ws) {
                     progress.reset();
                     progress.save(&ws.root)?;
+                    ws.manifest.not_working_checks = 0;
                     prompt = p;
                     continue;
                 }
@@ -777,10 +830,14 @@ impl Worker {
                 }
             }
             round += 1;
-            self.step(ws, Step::Check, Status::Checking, "Checking the build against the original…")?;
+            let checking = if ws.manifest.target == TargetRef::None { "Checking the build…" } else { "Checking the build against the original…" };
+            self.step(ws, Step::Check, Status::Checking, checking)?;
             let checks = self.checks_with_a_retry(ws, kind, round)?;
             ws.manifest.checks.extend(checks.iter().cloned());
             ws.manifest.awaiting_check = false;
+            // A round in which every check works (built and served) ends the streak; any other
+            // round adds to it, across runs, until the limit stops the build.
+            ws.manifest.not_working_checks = if checks.iter().all(|c| c.passed) { 0 } else { ws.manifest.not_working_checks.saturating_add(1) };
             ws.save()?;
             for c in &checks {
                 self.emit(RunEvent::Checked(c.clone()));
@@ -788,6 +845,7 @@ impl Worker {
             if let Some(p) = self.added(ws) {
                 progress.reset();
                 progress.save(&ws.root)?;
+                ws.manifest.not_working_checks = 0;
                 prompt = p;
                 continue;
             }
@@ -804,11 +862,17 @@ impl Worker {
                 }
             }
             let Some(check) = not_good else { break };
+            if ws.manifest.not_working_checks >= NOT_WORKING_CHECK_LIMIT {
+                return Err(not_working(ws));
+            }
             if refinements >= opts.max_rounds {
                 break;
             }
             refinements += 1;
-            prompt = kind.refine(check) + &pictures_reminder(ws);
+            // Nothing written yet: a fix for a build that doesn't exist sends the builder looking for one.
+            // It is asked to write the project and to show its build output (#736).
+            let refined = if app_is_empty(ws) { NO_PROJECT_PROMPT.to_string() } else { kind.refine(check) };
+            prompt = refined + &pictures_reminder(ws);
             if !api_loop {
                 prompt.push_str(CHECK_BEFORE_REPLYING);
             }
@@ -1046,6 +1110,15 @@ impl Worker {
                 agent.stop();
             }
             for e in agent.poll() {
+                if matches!(e, AgentEvent::ToolFinished { .. } | AgentEvent::TurnDone { .. }) {
+                    let mut session = self.engine.session();
+                    let project = session.project.clone().filter(|project| project.root == ws.investigation_dir());
+                    if let Some(project) = project
+                        && let Err(error) = session.open_project(project)
+                    {
+                        log::warn!("Couldn't refresh the investigation: {}", error.message);
+                    }
+                }
                 match &e {
                     AgentEvent::TextDelta { text } => reply.push_str(text),
                     // Our own loop asks before tools that need consent. The Build tools are the
@@ -1120,9 +1193,54 @@ impl Worker {
     }
 }
 
+/// Checks in a row that may find the build not working before the run stops and asks for a new
+/// request. Each "Try again" used to start another `max_rounds` of checks, with nothing counting
+/// across runs, so a build that never came up was checked 40 and 49 times (#736).
+pub const NOT_WORKING_CHECK_LIMIT: u32 = 10;
+
+fn not_working(ws: &Workspace) -> ToolError {
+    ToolError::new(ErrorCode::OverLimit, format!("The build still isn't working after {} checks in a row, so it stopped.", ws.manifest.not_working_checks))
+        .with_remediation("Send a new request with a concrete correction to start again. The last check's note in the feed says what it found.")
+}
+
+/// The builder's next request when app/ holds no files: write the project first, then say what the
+/// build printed. The reporter's agent claimed `npm run build` had passed while app/ was empty (#736).
+const NO_PROJECT_PROMPT: &str = "The check found no project: app/ has no files, so nothing has been written yet and nothing can be built. Create the project's files in app/ now (for a website, a package.json and an index.html or the source files), then build it. Reply with the exact command you ran and the last lines of its output. Say something is built only when that output says so.";
+
 fn no_build_progress(ws: &Workspace) -> ToolError {
-    ToolError::new(ErrorCode::OverLimit, format!("The build stopped after two builder turns changed no files in {}.", ws.app_place()))
-        .with_remediation("Send a new request with a concrete correction, or edit the app's files before trying again.")
+    let stop = format!("The build stopped after two builder turns changed no files in {}.", ws.app_place());
+    // #736: an empty app/ means the builder never wrote the project, whatever its replies said.
+    if app_is_empty(ws) {
+        ToolError::new(ErrorCode::OverLimit, format!("{stop} {}", no_files_yet(ws)))
+            .with_remediation("Send a new request that asks for the project's files in app/ (such as package.json and index.html), or try another builder.")
+    } else {
+        ToolError::new(ErrorCode::OverLimit, stop)
+            .with_remediation("Send a new request with a concrete correction, or edit the app's files before trying again.")
+    }
+}
+
+/// Whether the builder has written nothing into app/ (#736). A project folder always holds the
+/// workspace's own files, so only app/ can be empty.
+fn app_is_empty(ws: &Workspace) -> bool {
+    !ws.manifest.app_in_root && folder_is_empty(&ws.app_dir())
+}
+
+/// Whether a folder holds nothing: no files or folders, or no folder at all.
+fn folder_is_empty(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map(|mut entries| entries.next().is_none()).unwrap_or(true)
+}
+
+/// Said when app/ is empty, so a builder that claims it built the project can't hide that nothing
+/// was written (#736).
+fn no_files_yet(ws: &Workspace) -> String {
+    format!("{} has no files yet, so the builder hasn't written the project.", ws.app_place())
+}
+
+/// Why a coding agent can't build: never signed in, or signed in `before` with a sign-in that no
+/// longer works (expired, or signed out), which the person may not expect.
+fn not_signed_in(agent: &str, before: bool) -> String {
+    let who = crate::cli_agents::display_for(agent);
+    if before { format!("{who}'s sign-in on this computer has expired or was signed out.") } else { format!("{who} isn't signed in on this computer.") }
 }
 
 /// Largest builder session the project keeps a copy of.
@@ -1156,17 +1274,28 @@ pub fn project_builder<'a>(cfg: &crate::AiConfig, ws: &'a Workspace) -> Option<&
     ws.manifest.builder.as_deref().filter(|n| cfg.get(n).is_some_and(|b| b.config.enabled))
 }
 
-/// The backend that builds: the one named, else the Builder role's, else an agent app, else any
-/// enabled AI backend (which builds with our own agent loop and the Build tools).
+/// The backend that builds: the one named while it is set up and on, else the Builder role's,
+/// else an agent app, else any enabled AI backend (which builds with our own agent loop and the
+/// Build tools).
 pub fn builder_backend(cfg: &crate::AiConfig, named: Option<&str>) -> Result<crate::BackendEntry, ToolError> {
-    let found = match named {
-        Some(n) => cfg.get(n).cloned(),
-        None => {
-            cfg.backend_for(Role::Builder).or_else(|| cfg.enabled().find(|b| b.config.kind == BackendKind::AgentCli)).or_else(|| cfg.enabled().next()).cloned()
+    if let Some(n) = named {
+        let Some(entry) = cfg.get(n) else {
+            return Err(
+                ToolError::invalid(format!("No AI backend named {n:?}")).with_remediation("See `craft-anything-cli ai list`, or add one in Settings → AI.")
+            );
+        };
+        if !entry.config.enabled {
+            return Err(ToolError::new(ErrorCode::BadSettings, format!("{} is turned off.", entry.config.name))
+                .with_remediation("Turn it on in Settings → AI, or choose another backend for this build."));
         }
-    };
-    found.ok_or_else(|| {
-        ToolError::new(ErrorCode::BadSettings, "Building needs a coding agent (such as Claude Code) or an AI backend with an API key.")
-            .with_remediation("Install a coding agent or add an API key in Settings → AI, then try again.")
-    })
+        return Ok(entry.clone());
+    }
+    cfg.backend_for(Role::Builder)
+        .or_else(|| cfg.enabled().find(|b| b.config.kind == BackendKind::AgentCli))
+        .or_else(|| cfg.enabled().next())
+        .cloned()
+        .ok_or_else(|| {
+            ToolError::new(ErrorCode::BadSettings, "Building needs a coding agent (such as Claude Code) or an AI backend with an API key.")
+                .with_remediation("Install a coding agent or add an API key in Settings → AI, then try again.")
+        })
 }

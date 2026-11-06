@@ -14,7 +14,7 @@
 <h1 align="center">Craft Anything</h1>
 
 <p align="center">
-  <b>English</b> · <a href="README.ja.md">日本語</a> · <a href="README.zh.md">简体中文</a> · <a href="README.ko.md">한국어</a>
+  <b>English</b> · <a href="README.ja.md">日本語</a> · <a href="README.zh.md">简体中文</a> · <a href="README.zh-hant.md">繁體中文</a> · <a href="README.ko.md">한국어</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.pt.md">Português</a>
 </p>
 
 <p align="center">
@@ -83,7 +83,7 @@
     </td>
     <td width="25%" valign="top">
       <h3>🤖 Agent-ready</h3>
-      314 tools, each one a CLI command and an MCP tool, so any agent can drive the same engine the app uses. No AI is needed to inspect.
+      320 tools, each one a CLI command and an MCP tool, so any agent can drive the same engine the app uses. No AI is needed to inspect.
     </td>
   </tr>
 </table>
@@ -137,6 +137,12 @@ Both modes drive the same engine.
   built-in engines (and Ghidra when it's installed), a website's JavaScript is read and its start
   page watched, and the builder may use all of them.
 
+Clean room is a rule about what Craft Anything offers and refuses. It is not an operating-system
+sandbox: it doesn't isolate your computer. A coding agent you run still acts as you, and what it can
+read, write or run depends on its own permissions. Which of an agent's own tools Craft Anything can
+refuse differs by agent; for Claude Code's tools in chats and questions, see
+[`docs/claude-code.md`](docs/claude-code.md).
+
 Switch in the title bar or Settings, with `settings_set deep_mode true`, or for one CLI run with
 `--deep` (or `--clean-room`).
 
@@ -152,7 +158,8 @@ Building needs a coding agent on your computer. **Claude Code** is supported fir
 Anything runs your own, unmodified `claude` program, which uses your own sign-in; Craft Anything
 never sees or handles your account. Your use of it falls under your own agreement with
 Anthropic. See [docs/claude-code.md](docs/claude-code.md) for how and why. A Codex adapter
-exists but hasn't been verified on a real install yet. Other agents that speak ACP (Gemini CLI,
+exists but hasn't been verified on a real install yet. **GitHub Copilot** can use your installed
+Copilot CLI through ACP: sign in separately with `copilot login`. Other agents that speak ACP (Gemini CLI,
 Qwen Code, opencode, goose, Hermes, Maki) can be switched to it per backend; of those, only Maki has
 been run live. Anthropic, OpenAI, OpenRouter and local
 OpenAI-compatible servers are available for questions and analysis (Settings → AI).
@@ -174,7 +181,7 @@ connects Craft Anything to coding-agent apps.
 
 ## Under the hood
 
-A pure-Rust reverse-engineering engine with 314 tools (298 in the engine, the rest from the AI and
+A pure-Rust reverse-engineering engine with 320 tools (300 in the engine, the rest from the AI and
 setup layers) for native programs, .NET, Java, Android, Apple, Electron/JavaScript, websites,
 firmware, packet captures, databases and game files. Its own decoders, disassembler and
 decompiler work without any outside program; Deep mode uses them all, and Ghidra when it's
@@ -247,6 +254,14 @@ bypasses DRM, logins or anti-cheat. Rebuilds recreate layout, style and behaviou
 the agent is told not to copy logos, photos or text unless you confirm you own them or have
 permission.
 
+**Installing dependencies runs code.** When a builder installs a project's dependencies, the commands
+run on your computer, and the packages can run code while they install. npm runs each package's
+install scripts by default, and Rust build scripts and Python source packages run their own setup
+code. Craft Anything asks before a command of a kind it hasn't seen in this project (`npm`, `cargo`…).
+Choosing "always allow" for `npm` lets every later npm command run without asking, so only do that
+for a project whose dependencies you trust. To install npm packages without their install scripts,
+run `npm install --ignore-scripts`.
+
 ## Downloads
 
 On GitHub, the [latest release](https://github.com/storytold/craft-anything/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/craft-anything/releases) has earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
@@ -290,17 +305,44 @@ If you already have the blocked copy, press Done (not Move to Bin), then run
 `xattr -d com.apple.quarantine <path to craft-anything-cli>`, or allow it in System Settings →
 Privacy & Security → Open Anyway.
 
+#### Checking that a Mac download is signed and notarized
+
+Each Mac release is signed with a Developer ID certificate and notarized by Apple. To check a download
+yourself, run these in Terminal (replace `<ver>` with the version and the paths with yours):
+
+```sh
+# The disk image: "accepted" and "source=Notarized Developer ID" mean it passed
+spctl --assess --type open --context context:primary-signature -v "craft-anything-<ver>-macos-universal.dmg"
+# The notarization ticket is attached: prints "The validate action worked!"
+xcrun stapler validate "craft-anything-<ver>-macos-universal.dmg"
+
+# The app, after you open the disk image: the signature must verify
+codesign --verify --deep --strict --verbose=2 "/Volumes/<disk image name>/Craft Anything.app"
+spctl --assess --type execute --verbose "/Volumes/<disk image name>/Craft Anything.app"
+
+# The command-line tool: a bare program can't carry a ticket, so macOS checks it online
+codesign --verify --strict --verbose=2 ~/.local/bin/craft-anything-cli
+codesign -dv --verbose=4 ~/.local/bin/craft-anything-cli 2>&1 | grep Authority
+```
+
+The `Authority` lines should name a "Developer ID Application" certificate. If a check fails, don't
+run the file; report it with the output and the release tag.
+
 ### Linux
 
 | Format | x86_64 | aarch64 (ARM64) | Notes |
 |---|---|---|---|
 | AppImage | `craft-anything-<ver>-linux-x86_64.AppImage` | `craft-anything-<ver>-linux-aarch64.AppImage` | Runs anywhere; updates itself with [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (`.zsync` files) |
-| Flatpak | `craft-anything-<ver>-linux-x86_64.flatpak` | `craft-anything-<ver>-linux-aarch64.flatpak` | Sandboxed; `flatpak install --user <file>` |
+| Flatpak | `craft-anything-<ver>-linux-x86_64.flatpak` | `craft-anything-<ver>-linux-aarch64.flatpak` | Sandboxed, so it can't start a browser on your computer, which studying websites needs (use another package for that); `flatpak install --user <file>` |
 | Debian/Ubuntu | `craft-anything-<ver>-linux-x86_64.deb` | `craft-anything-<ver>-linux-aarch64.deb` | |
 | Fedora/RHEL/openSUSE | `craft-anything-<ver>-linux-x86_64.rpm` | `craft-anything-<ver>-linux-aarch64.rpm` | |
 | Tarball | `craft-anything-<ver>-linux-x86_64.tar.gz` | `craft-anything-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
 
 RISC-V (riscv64): `craft-anything-<ver>-linux-riscv64.tar.gz`, a tarball only.
+
+The AppImage carries the CLI too: run `<AppImage> --cli <command>` (for example
+`<AppImage> --cli mcp` for an MCP client), or make a link to the AppImage named
+`craft-anything-cli` and run that.
 
 ### FreeBSD
 
@@ -356,6 +398,7 @@ RISC-V (riscv64): `craft-anything-<ver>-linux-riscv64.tar.gz`, a tarball only.
 | <img src="https://raw.githubusercontent.com/storytold/cadcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.cadcraft.png" alt="" width="32" height="32"> | **CADCraft** | Computer-aided design | [GitHub](https://github.com/storytold/cadcraft) | [Website](https://getartcraft.com/apps/cadcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/gridcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.gridcraft.png" alt="" width="32" height="32"> | **GridCraft** | Spreadsheets and data | [GitHub](https://github.com/storytold/gridcraft) | [Website](https://getartcraft.com/apps/gridcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/texturecraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.texturecraft.png" alt="" width="32" height="32"> | **TextureCraft** | 3D texture painting | [GitHub](https://github.com/storytold/texturecraft) | [Website](https://getartcraft.com/apps/texturecraft) |
+| <img src="https://raw.githubusercontent.com/storytold/materialcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.materialcraft.png" alt="" width="32" height="32"> | **MaterialCraft** | Node-based procedural materials | [GitHub](https://github.com/storytold/materialcraft) | [Website](https://getartcraft.com/apps/materialcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/craft-anything/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.craft-anything.png" alt="" width="32" height="32"> | **Craft Anything** | See how any software works, then build your own | [GitHub](https://github.com/storytold/craft-anything) | [Website](https://getartcraft.com/apps/craft-anything) |
 | <img src="https://raw.githubusercontent.com/tangency-labs/solidcraft/main/assets/icons/app/linux/exports/hicolor/64x64/apps/io.tangencylabs.solidcraft.png" alt="" width="32" height="32"> | **SolidCraft** | Parametric 3D CAD by Tangency Labs (community app) | [GitHub](https://github.com/tangency-labs/solidcraft) | |
 
@@ -363,7 +406,7 @@ RISC-V (riscv64): `craft-anything-<ver>-linux-riscv64.tar.gz`, a tarball only.
 ## License and credits
 
 Craft Anything is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
-Copyright (c) 2026 ArtCraft Team and the Craft Anything contributors. Required notices are in [NOTICE](NOTICE).
+Copyright (c) 2026 ArtCraft Team and the Craft Anything contributors ([CONTRIBUTORS.md](CONTRIBUTORS.md)). Required notices are in [NOTICE](NOTICE).
 
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).

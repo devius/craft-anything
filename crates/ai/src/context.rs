@@ -35,10 +35,19 @@ pub fn estimate_tokens(history: &[Msg]) -> u64 {
             Block::Thinking { thinking, .. } => thinking.len(),
             Block::RedactedThinking { data } => data.len(),
             Block::ToolUse { input, name, .. } => name.len() + input.to_string().len(),
+            Block::ToolExtra { extra, .. } => extra.to_string().len(),
             Block::ToolResult { content, .. } => content.len(),
         })
         .sum();
     (chars / 4) as u64
+}
+
+/// About how many tokens go with every turn besides the conversation: the system prompt, and each
+/// tool's name, description and schema (4 characters a token, as [`estimate_tokens`]). A server that
+/// reports no usage leaves these out of its count, so they are counted from their text (#731).
+pub fn estimate_overhead(system: &str, tools: &[crate::model::ToolDef]) -> u64 {
+    let tool_chars: usize = tools.iter().map(|t| t.name.len() + t.description.len() + t.schema.to_string().len()).sum();
+    ((system.len() + tool_chars) / 4) as u64
 }
 
 /// Shorten tool results and drop reasoning in all but the last [`KEEP_RECENT`] messages. Returns

@@ -44,15 +44,20 @@ impl TargetKind for AppKind {
         "a desktop app with the same core features"
     }
 
+    /// Describe the checks for a new app: screenshots or recorded console runs, plus Deep-mode
+    /// requirements when studying a program. Existing projects keep their own build/test contract.
     fn brief_sections(&self, cx: &BriefCx) -> Vec<String> {
         let mut s = Vec::new();
+        if cx.ws.manifest.own_project() {
+            return s;
+        }
         if cx.deep && matches!(cx.ws.manifest.target, TargetRef::Local { .. }) {
             s.push(decompile_note(false, cx.ghidra).trim_start().to_string());
             s.push(mechanics::MECHANICS_CONTRACT.to_string());
         }
         // A console program is compared by its runs, not pictured.
         if runs::captured(cx.ws).is_empty() {
-            s.push(screenshot::SCREENSHOT_CONTRACT.to_string());
+            s.push(screenshot::contract());
         } else {
             s.push(RUNS_BRIEF.to_string());
         }

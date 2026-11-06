@@ -25,6 +25,15 @@ pub fn build_with(name: &str) -> Result<&'static stacks::Stack, ToolError> {
     })
 }
 
+/// The stack a project starts with. One edited in place keeps what its files are built with,
+/// unless its request names another; any other goes by its request and target.
+pub(super) fn first_stack(kinds: &KindRegistry, ws: &Workspace, deep: bool) -> Option<&'static str> {
+    let m = &ws.manifest;
+    let own = m.app_in_root && kinds.named(&m.request, &m.target).is_none();
+    let found = own.then(|| stacks::found_in(&ws.app_dir())).flatten();
+    found.map(|s| s.name.as_str()).or_else(|| kinds.choose(&m.request, &m.target, deep).map(|(_, stack)| stack))
+}
+
 /// A new project for `request` about `target` (a web address, an absolute path, or `-` for none),
 /// at `place`, with the stack the person
 /// picked (`build_with`), the asset budget from settings, and `generate_assets`: the person lets the
@@ -48,7 +57,13 @@ pub fn new_project(
     let mut ws = match place {
         Place::Projects => Workspace::create(&settings.projects_dir(), &name, request, target_ref)?,
         Place::In(dir) => Workspace::create(dir, &name, request, target_ref)?,
-        Place::At(folder, existing) => Workspace::create_at(folder, &name, request, target_ref, existing)?,
+        Place::At(folder, existing) => {
+            if folder.join(craft_anything_engine::workspace::MANIFEST).is_file() {
+                Workspace::open(folder)?
+            } else {
+                Workspace::create_at(folder, &name, request, target_ref, existing)?
+            }
+        }
     };
     if let Some(s) = stack {
         ws.manifest.stack = s.name.clone();

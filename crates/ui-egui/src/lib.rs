@@ -7,9 +7,11 @@
 //! holding it never freezes a frame; the last snapshot ([`SessionView`]) is shown meanwhile.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod approvals;
 pub mod builders;
 pub mod chat;
 pub mod demo;
+pub mod detect_tabs;
 pub mod engine_ui;
 pub mod evidence_ui;
 pub mod first_run;
@@ -24,6 +26,8 @@ pub mod jobs;
 pub mod just_ask;
 pub mod make;
 pub mod manage;
+#[cfg(target_os = "macos")]
+pub mod menu;
 pub mod palette;
 pub mod paste;
 pub mod pins;
@@ -151,7 +155,8 @@ pub enum Done {
         path: PathBuf,
         result: Result<Value, ToolError>,
     },
-    Detected(Vec<Detected>),
+    /// What a scan found, and why an expected coding agent may be missing.
+    Detected(Vec<Detected>, Vec<craft_anything_ai::detect::DetectHint>),
     /// The configured backends, the ones chosen to build with and to extract with, and each one's
     /// options.
     Backends(Vec<BackendConfig>, Option<String>, Option<String>, std::collections::BTreeMap<String, craft_anything_ai::BackendOptions>),
@@ -165,6 +170,20 @@ pub enum Done {
         context: craft_anything_ai::ModelContext,
         result: Result<Vec<craft_anything_ai::AgentModel>, ToolError>,
     },
+    ModelTuning {
+        name: String,
+        cli_model: Option<String>,
+        result: Result<craft_anything_ai::model_options::ModelTuning, ToolError>,
+    },
+    ModelChanged {
+        name: String,
+        model: String,
+        result: Result<craft_anything_ai::BackendOptions, ToolError>,
+    },
+    ModelOptionsSaved {
+        params: craft_anything_ai::model_options::SetModelOptions,
+        result: Result<(), ToolError>,
+    },
     Picked {
         pick: Pick,
         path: Option<PathBuf>,
@@ -177,6 +196,14 @@ pub enum Done {
     Pasted {
         project: Option<PathBuf>,
         files: Vec<PathBuf>,
+        /// The first picture over 20 MB, if any (checked on the worker that read the paste).
+        refused: Option<String>,
+    },
+    /// Picture sizes were checked on a worker, before the UI attaches them.
+    PicturesChecked {
+        files: Vec<PathBuf>,
+        refused: Option<String>,
+        target: crate::project::PictureTarget,
     },
     /// The game engines on this computer were listed.
     GameEngines(craft_anything_engines::game::Inventory),
@@ -206,6 +233,8 @@ pub enum Done {
     BackendAdded {
         name: String,
         result: Result<(), ToolError>,
+        /// `CraftApp::backend_choices` when the add started: a choice made since then stands.
+        choices: u64,
     },
     /// The projects folder was listed.
     Projects(Vec<craft_anything_engine::workspace::Workspace>),
@@ -264,6 +293,8 @@ pub enum Pick {
     ProjectsDir,
     /// The folder a new project starts in (it may already have the person's files).
     ProjectFolder,
+    /// The folder of a project the person already has ("Work on my project").
+    OwnProject,
     /// Another folder whose projects are listed (Settings).
     ExtraProjectsDir,
     /// Pictures of the original to match (several at once).
@@ -289,6 +320,32 @@ pub struct TargetInfo {
     pub bytes: Arc<[u8]>,
 }
 
+/// Cached choices and editable values for one backend/model. Changes save immediately; controls
+/// stay in place while discovery or a save is pending, and failures retain a retryable state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelTuningDraft {
+    pub backend: String,
+    pub cli_model: Option<String>,
+    pub choices: Option<craft_anything_ai::model_options::ModelTuning>,
+    pub context: Option<craft_anything_ai::config::CliContext>,
+    #[serde(default)]
+    pub saving: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl ModelTuningDraft {
+    /// Drop an override the selected model does not advertise before presenting its controls.
+    pub fn set_choices(&mut self, choices: craft_anything_ai::model_options::ModelTuning) {
+        self.context = self.context.filter(|value| choices.context.iter().any(|choice| choice.value == *value));
+        self.choices = Some(choices);
+    }
+
+    pub fn params(&self) -> craft_anything_ai::model_options::SetModelOptions {
+        craft_anything_ai::model_options::SetModelOptions { backend: self.backend.clone(), expected_cli_model: self.cli_model.clone(), context: self.context }
+    }
+}
+
 /// The last snapshot of the session, refreshed whenever the lock is free and something changed.
 #[derive(Debug, Clone, Default)]
 pub struct SessionView {
@@ -299,6 +356,8 @@ pub struct SessionView {
     pub ledger: Vec<Evidence>,
     pub ledger_len: usize,
     pub unknowns: Vec<Unknown>,
+    /// Recorded answers (`fnd_*`), distinct from the evidence ledger that supports them.
+    pub findings: Vec<craft_anything_engine::tools::investigation_tools::Finding>,
     pub project: Option<String>,
     pub project_allows: Vec<String>,
 }
@@ -367,6 +426,9 @@ pub struct CraftApp {
     pub persist: bool,
     /// Never open native dialogs (tests and snapshots).
     pub headless: bool,
+    /// The macOS menu bar, once the window is open ([`CraftApp::install_menu_bar`]).
+    #[cfg(target_os = "macos")]
+    pub menu_bar: Option<menu::MenuBar>,
     pub view: SessionView,
     pub jobs: jobs::Jobs<Done>,
     pub conversation: Option<Box<dyn Conversation>>,
@@ -378,14 +440,21 @@ pub struct CraftApp {
     pub model_picker: Option<(String, Option<Vec<String>>)>,
     pub agent_model_picker: Option<builders::AgentModelPicker>,
     model_request: u64,
+    pub model_tuning: std::collections::BTreeMap<String, ModelTuningDraft>,
     /// The agent app whose program the file dialog is choosing.
     pub picking_program_for: Option<String>,
+    /// Claude Code folders being typed in Settings → AI, by AI, until they're saved.
+    pub folder_inputs: std::collections::BTreeMap<String, String>,
     /// The backend the person chose to build with (Settings → AI), if any.
     pub builder: Option<String>,
     /// The backend chosen to take a game's files out in Deep mode, if any.
     pub extractor: Option<String>,
     pub detected: Option<Vec<Detected>>,
+    /// Why an expected coding agent may be missing, from the last scan.
+    pub detect_hints: Vec<craft_anything_ai::detect::DetectHint>,
     pub detecting: bool,
+    /// Counts AI choices, so an add that finishes later doesn't undo one made meanwhile.
+    pub backend_choices: u64,
     pub log: Vec<LogLine>,
     pub key_inputs: std::collections::BTreeMap<String, String>,
     /// Settings → AI's "Add an AI by its address" form. Not kept with the UI state: its key goes
@@ -398,6 +467,14 @@ pub struct CraftApp {
     pub drafts: std::collections::HashMap<u64, project::Draft>,
     /// A picture still being pasted into the open project's prompt box (`paste_pictures`).
     pub pending_paste: Option<project::PendingPaste>,
+    /// Picture-size checks still running for each project's prompt box, and for Make. Send and
+    /// Make Start wait only for their own destination.
+    pending_attach_checks: std::collections::BTreeMap<PathBuf, usize>,
+    pending_make_checks: usize,
+    /// Projects whose Send is waiting for their own picture checks to finish.
+    send_after_checks: std::collections::BTreeSet<PathBuf>,
+    /// The Make draft Start was pressed for, while its picture checks finish.
+    start_after_pictures: Option<state::MakeDraft>,
     /// Each project's building time and AI use, every build together (read from its usage.json).
     pub usage: std::collections::HashMap<PathBuf, usage::ProjectClock>,
     /// All AI use since the app opened: builds and chat.
@@ -477,6 +554,8 @@ impl CraftApp {
             first_frames: None,
             persist: true,
             headless: false,
+            #[cfg(target_os = "macos")]
+            menu_bar: None,
             view: SessionView::default(),
             jobs: jobs::Jobs::default(),
             conversation: None,
@@ -485,17 +564,25 @@ impl CraftApp {
             model_picker: None,
             agent_model_picker: None,
             model_request: 0,
+            model_tuning: Default::default(),
             picking_program_for: None,
+            folder_inputs: Default::default(),
             builder: None,
             extractor: None,
             detected: None,
+            detect_hints: Vec::new(),
             detecting: false,
+            backend_choices: 0,
             log: Vec::new(),
             key_inputs: Default::default(),
             server_form: ServerForm::default(),
             runs: craft_anything_ai::rebuild::RunSet::new(craft_anything_engine::settings::BuildSettings::default().parallel),
             drafts: Default::default(),
             pending_paste: None,
+            pending_attach_checks: Default::default(),
+            pending_make_checks: 0,
+            send_after_checks: Default::default(),
+            start_after_pictures: None,
             usage: Default::default(),
             session_usage: Default::default(),
             workspace: None,
@@ -536,6 +623,18 @@ impl CraftApp {
     pub fn setup_context(ctx: &egui::Context) {
         theme::install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
+        // The zoom keys are ours (`shortcuts`), so zoom stays inside ZOOM_RANGE.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+    }
+
+    /// Gives the macOS app its menu bar (nothing elsewhere). Call once the window is open.
+    pub fn install_menu_bar(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        {
+            self.menu_bar = menu::MenuBar::install(ctx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = ctx;
     }
 
     /// Call `done` once [`FIRST_FRAMES`] frames have been drawn and shown: the window is really up by
@@ -764,6 +863,7 @@ impl CraftApp {
             },
             ledger_len: s.ledger_len(),
             unknowns: s.unknowns().take(500).cloned().collect(),
+            findings: craft_anything_engine::tools::investigation_tools::cached(&s).findings,
             project: s.project.as_ref().map(|p| p.meta.name.clone()),
             project_allows: s.project.as_ref().map(|p| p.meta.allowed_tools.clone()).unwrap_or_default(),
         };
@@ -875,6 +975,7 @@ impl CraftApp {
                 }
                 self.toast(tr("Called done. A new message carries on from here."), false);
             }
+            ("project_approvals_set", r) => self.approval_set(r),
             ("project_questions_set", Ok(v)) => {
                 // What was saved (the person's other changes on disk come along).
                 if let Some(ws) = self.workspace.as_mut().filter(|w| v["project"].as_str().is_some_and(|p| w.root == std::path::Path::new(p))) {
@@ -1007,6 +1108,7 @@ impl CraftApp {
                 Pick::TargetFolder => pollster::block_on(d.set_title(tr("Pick the app or game folder")).pick_folder()),
                 Pick::ProjectsDir => pollster::block_on(d.set_title(tr("Where should new projects go?")).pick_folder()),
                 Pick::ProjectFolder => pollster::block_on(d.set_title(tr("Pick the folder for this project")).pick_folder()),
+                Pick::OwnProject => pollster::block_on(d.set_title(tr("Pick your project's folder")).pick_folder()),
                 Pick::ExtraProjectsDir => pollster::block_on(d.set_title(tr("Pick a folder with projects in it")).pick_folder()),
                 Pick::GameFolder => pollster::block_on(d.set_title(tr("Pick the game's folder")).pick_folder()),
                 Pick::SavePicture => pollster::block_on(d.set_title(tr("Save the picture")).add_filter("PNG", &["png"]).set_file_name(&suggested).save_file()),
@@ -1105,19 +1207,26 @@ impl CraftApp {
         }
         self.detecting = true;
         let hub = self.hub.clone();
-        self.jobs.spawn("Look for AI on this computer", true, move |_| Ok(Done::Detected(hub.detect())));
+        self.jobs.spawn("Look for AI on this computer", true, move |_| Ok(Done::Detected(hub.detect(), hub.detect_hints())));
     }
 
     pub fn add_backend(&mut self, config: BackendConfig, key: Option<String>) {
         let hub = self.hub.clone();
         let name = config.name.clone();
+        let choices = self.backend_choices;
         self.jobs.spawn(i18n::trf("Connect {name}", &[("name", &name)]), true, move |_| {
             let result = hub.add_backend(config, key);
-            Ok(Done::BackendAdded { name, result })
+            Ok(Done::BackendAdded { name, result, choices })
         });
     }
 
     pub fn choose_backend(&mut self, name: Option<String>) {
+        self.backend_choices = self.backend_choices.wrapping_add(1);
+        self.select_backend(name);
+    }
+
+    /// Select a backend without counting it as the person's choice (an add that finished).
+    fn select_backend(&mut self, name: Option<String>) {
         if self.state.backend != name {
             self.state.backend = name;
             if let Some(mut c) = self.conversation.take() {
@@ -1133,10 +1242,20 @@ impl CraftApp {
             return;
         }
         self.state.chat.push(ChatItem::User(text.clone()));
+        if self.state.backend.is_some() {
+            // Each message to this AI is a choice too: an AI that finishes connecting meanwhile
+            // doesn't take over (and stop) the answer.
+            self.backend_choices = self.backend_choices.wrapping_add(1);
+        }
         if self.state.backend.is_some() && self.conversation.is_none() {
             match self.hub.start(self.state.backend.as_deref(), self.beginner()) {
                 Ok(c) => self.conversation = Some(c),
-                Err(e) => self.state.chat.push(ChatItem::Error { message: e.message, remediation: e.remediation, log: None }),
+                // The AI that was picked didn't start (it may be turned off), so the error is the
+                // answer; an AI is set up, so the built-in engines' "no AI brain" line would be wrong.
+                Err(e) => {
+                    self.state.chat.push(ChatItem::Error { message: e.message, remediation: e.remediation, log: None });
+                    return;
+                }
             }
         }
         if let Some(c) = self.conversation.as_mut() {
@@ -1190,6 +1309,7 @@ impl CraftApp {
             match e {
                 AgentEvent::ToolFinished { .. } => self.view_dirty = true,
                 AgentEvent::TurnDone { backend, input_tokens, output_tokens, cost_usd, cost_is_estimate } => {
+                    self.view_dirty = true;
                     self.session_usage.add_turn(input_tokens, output_tokens, cost_usd, cost_is_estimate);
                     let cost = cost_usd.map(|c| format!(", ${c:.4}")).unwrap_or_default();
                     self.log(false, format!("{backend}: {input_tokens} in / {output_tokens} out{cost}"));
@@ -1296,7 +1416,12 @@ impl CraftApp {
         };
         match done {
             Done::Nothing => {}
-            Done::Projects(p) => {
+            Done::Projects(mut p) => {
+                if let Some(ws) = &self.workspace
+                    && !p.iter().any(|w| w.root == ws.root)
+                {
+                    p.insert(0, ws.clone());
+                }
                 self.projects = p;
                 self.refresh_pins();
             }
@@ -1343,7 +1468,8 @@ impl CraftApp {
                     self.toast(e.for_people(), true);
                 }
             },
-            Done::Detected(d) => {
+            Done::Detected(d, hints) => {
+                self.detect_hints = hints;
                 self.detecting = false;
                 self.log(false, format!("Found {} AI option(s) on this computer", d.len()));
                 self.detected = Some(d);
@@ -1356,6 +1482,10 @@ impl CraftApp {
                 self.builder = builder;
                 self.extractor = extractor;
                 self.backend_options = options;
+                self.model_tuning.retain(|name, state| {
+                    self.backends.iter().any(|backend| backend.name == *name && craft_anything_ai::model_options::supported(backend))
+                        && self.backend_options.get(name).and_then(|options| options.cli_model.as_ref()) == state.cli_model.as_ref()
+                });
             }
             Done::ModelChoices { name, result } => match result {
                 // Kept only while the picker is still open for that AI.
@@ -1373,13 +1503,75 @@ impl CraftApp {
                     picker.result = Some(result.map_err(|e| e.for_people()));
                 }
             }
-            Done::BackendAdded { name, result } => match result {
+            Done::ModelTuning { name, cli_model, result } => {
+                let current = self.backend_options.get(&name).and_then(|options| options.cli_model.clone());
+                if self.model_tuning.get(&name).is_some_and(|state| state.cli_model == cli_model) {
+                    if current != cli_model {
+                        self.model_tuning.remove(&name);
+                    } else {
+                        match result {
+                            Ok(choices) => {
+                                if let Some(draft) = self.model_tuning.get_mut(&name) {
+                                    draft.set_choices(choices);
+                                }
+                            }
+                            Err(error) => {
+                                if let Some(state) = self.model_tuning.get_mut(&name) {
+                                    state.error = Some(error.for_people());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Done::ModelChanged { name, model, result } => match result {
+                Ok(options) => {
+                    if let Some(backend) = self.backends.iter_mut().find(|backend| backend.name == name) {
+                        if backend.kind != craft_anything_ai::BackendKind::AgentCli {
+                            backend.model = model;
+                        }
+                        self.backend_options.insert(name.clone(), options);
+                    }
+                    self.model_tuning.remove(&name);
+                }
+                Err(error) => {
+                    if let Some(state) = self.model_tuning.get_mut(&name) {
+                        state.saving = false;
+                    }
+                    self.toast(error.for_people(), true);
+                }
+            },
+            Done::ModelOptionsSaved { params, result } => {
+                let current = self.backend_options.get(&params.backend).and_then(|options| options.cli_model.clone());
+                if current == params.expected_cli_model {
+                    if result.is_ok()
+                        && let Some(options) = self.backend_options.get_mut(&params.backend)
+                    {
+                        options.cli_context = params.context;
+                    }
+                    if let Some(state) = self.model_tuning.get_mut(&params.backend) {
+                        state.saving = false;
+                        if result.is_err()
+                            && let Some(options) = self.backend_options.get(&params.backend)
+                        {
+                            state.context = options.cli_context;
+                        }
+                    }
+                }
+                if let Err(error) = result {
+                    self.toast(error.for_people(), true);
+                }
+            }
+            Done::BackendAdded { name, result, choices } => match result {
                 Ok(()) => {
                     if self.server_form.name.trim() == name {
                         self.server_form = ServerForm::default();
                     }
                     self.toast(i18n::trf("{name} is ready", &[("name", &name)]), false);
-                    self.choose_backend(Some(name));
+                    // Picking another AI (or none) while this one connected wins.
+                    if choices == self.backend_choices {
+                        self.select_backend(Some(name));
+                    }
                     self.refresh_backends();
                 }
                 Err(e) => self.toast(e.for_people(), true),
@@ -1405,6 +1597,7 @@ impl CraftApp {
                             self.refresh_projects();
                         }
                         Pick::ProjectFolder => folders::picked(self, path),
+                        Pick::OwnProject => folders::picked_own(self, path),
                         Pick::ExtraProjectsDir => self.add_project_folder(path),
                         Pick::GameFolder => game_files::folder_picked(self, path),
                         Pick::SavePicture => game_files::save_to(self, path),
@@ -1412,15 +1605,15 @@ impl CraftApp {
                             if let Some(name) = self.picking_program_for.take() {
                                 self.set_agent_program(&name, Some(path.display().to_string()));
                             }
-                        }
-                        // Several files: these come back as Done::Pictures / Done::ToAttach.
+                        } // Several files: these come back as Done::Pictures / Done::ToAttach.
                         Pick::Pictures | Pick::Attach => {}
                     }
                 }
             }
             Done::Pictures(files) => self.add_pictures(files),
             Done::ToAttach(files) => self.attach(files),
-            Done::Pasted { project, files } => self.pasted(project, files),
+            Done::Pasted { project, files, refused } => self.pasted(project, files, refused),
+            Done::PicturesChecked { files, refused, target } => self.pictures_checked(files, refused, target),
             Done::Attached { root, text, attachments, files } => self.deliver(root, text, attachments, files),
             Done::GameEngines(inv) => self.engines_found(inv),
             Done::GameFound { path, found } => {
@@ -1574,14 +1767,16 @@ impl CraftApp {
         let ctx = ui.ctx().clone();
         self.tick(&ctx);
         self.shortcuts(&ctx);
+        #[cfg(target_os = "macos")]
+        menu::update(self, &ctx);
         let t = theme::Tokens::get(&ctx);
         // The title bar is on every screen: it is how the window moves, resizes and closes.
-        egui::Panel::top("titlebar").exact_size(titlebar::HEIGHT).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
-            guard_ui(ui, "title bar", |ui| titlebar::show(self, ui));
-        });
+        titlebar::bar(self, ui);
         self.stuck_banner(ui, &ctx);
         if !self.settings.first_run_done {
             egui::CentralPanel::default().frame(egui::Frame::new().fill(t.canvas)).show(ui, |ui| guard_ui(ui, "first run", |ui| first_run::show(self, ui)));
+            // An AI added from the first run reports a failure here (a wrong address or key).
+            self.toasts(&ctx);
             titlebar::window_edge(&ctx);
             titlebar::resize_edges(&ctx);
             return;
@@ -1688,13 +1883,30 @@ impl CraftApp {
         painter.galley(inner.center() - g.size() / 2.0, g, t.text);
     }
 
+    /// Keys that work on every screen: Ctrl/⌘ K for the palette, and Esc to close what's on top
+    /// (the palette, a dialog, Settings) or go back home.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let (palette, esc) = ctx.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND, egui::Key::K), i.key_pressed(egui::Key::Escape)));
-        if palette && self.settings.first_run_done {
-            self.state.palette.open = !self.state.palette.open;
-            self.state.palette.query.clear();
-            self.state.palette.selected = 0;
-            self.state.palette.form_tool = None;
+        if palette {
+            palette::toggle(self);
+        }
+        // Cmd/Ctrl + / − / 0. A zoom saved from outside the range comes back inside it.
+        let zoom = ctx.zoom_factor();
+        let asked = ctx.input_mut(|i| {
+            use egui::gui_zoom::kb_shortcuts::{ZOOM_IN, ZOOM_IN_SECONDARY, ZOOM_OUT, ZOOM_RESET};
+            if i.consume_shortcut(&ZOOM_RESET) {
+                1.0
+            } else if i.consume_shortcut(&ZOOM_IN) || i.consume_shortcut(&ZOOM_IN_SECONDARY) {
+                zoom + 0.1
+            } else if i.consume_shortcut(&ZOOM_OUT) {
+                zoom - 0.1
+            } else {
+                zoom
+            }
+        });
+        let next = bounded_zoom(asked);
+        if next != zoom {
+            ctx.set_zoom_factor(next);
         }
         if esc {
             if self.state.palette.open {
@@ -1709,6 +1921,18 @@ impl CraftApp {
             }
         }
     }
+}
+
+/// How far the app zooms (Cmd/Ctrl + / −). Below half size its text is unreadable; above double,
+/// the smallest window has room for almost nothing. egui's own limits are 20% and 500%.
+pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+
+/// `zoom` on a 10% step, inside [`ZOOM_RANGE`].
+pub fn bounded_zoom(zoom: f32) -> f32 {
+    if !zoom.is_finite() {
+        return 1.0;
+    }
+    ((zoom * 10.0).round() / 10.0).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end())
 }
 
 /// The 256 px app icon.
@@ -1794,6 +2018,7 @@ impl eframe::App for CraftApp {
         for j in self.jobs.running() {
             j.cancel.cancel();
         }
+        craft_anything_engine::tools::deep::stop_analyses(std::time::Duration::from_secs(12));
         // A change not written yet (or one being written as the window closed) is written now.
         if self.persist && (self.settings_dirty || self.save_due.is_some() || self.saving.is_some()) {
             let saved = if let Some(mut session) = self.engine.try_session() {
