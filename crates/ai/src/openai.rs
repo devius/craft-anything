@@ -35,14 +35,19 @@ pub const OPENCODE_GO_DEFAULT_MODEL: &str = "kimi-k3.1-pro";
 /// Whether this base URL is OpenCode Go's: https, host opencode.ai, path under /inference/go/.
 /// A substring test would also match a look-alike host or a proxy path.
 pub fn is_opencode_go(base: &str) -> bool {
+    https_host_path(base).is_some_and(|(host, path)| host.eq_ignore_ascii_case("opencode.ai") && (path == "inference/go" || path.starts_with("inference/go/")))
+}
+
+/// An https address's host (without user or port) and path; `None` for any other scheme.
+pub(crate) fn https_host_path(base: &str) -> Option<(&str, &str)> {
     let base = base.trim().trim_end_matches('/');
-    let Some((scheme, rest)) = base.split_once("://") else { return false };
+    let (scheme, rest) = base.split_once("://")?;
     if !scheme.eq_ignore_ascii_case("https") {
-        return false;
+        return None;
     }
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
     let host = host.rsplit('@').next().unwrap_or(host).split(':').next().unwrap_or(host);
-    host.eq_ignore_ascii_case("opencode.ai") && (path == "inference/go" || path.starts_with("inference/go/"))
+    Some((host, path))
 }
 
 /// Well-known local servers: (name, base URL).
@@ -67,6 +72,8 @@ pub struct OpenAi {
     pub auto_react: bool,
     /// Talking to OpenRouter, which routes each request to one of several upstream providers.
     pub openrouter: bool,
+    /// How long one streamed answer may take (a slow local model can need hours).
+    pub stream_limit: std::time::Duration,
 }
 
 impl OpenAi {
@@ -96,6 +103,7 @@ impl OpenAi {
             react: false,
             auto_react: true,
             openrouter: false,
+            stream_limit: http::STREAM_BODY,
         }
     }
 
@@ -192,7 +200,7 @@ impl OpenAi {
     }
 
     fn stream_once(&self, req: &TurnRequest<'_>, on_delta: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
-        let agent = http::stream_agent();
+        let agent = http::stream_agent(self.stream_limit);
         let reader = http::post_json(&agent, &self.label, &self.url("chat/completions"), &self.headers(), &self.body(req))?;
         let mut st = ChatStream::default();
         http::parse_sse(reader, |ev| {
@@ -267,9 +275,22 @@ pub fn messages_json(m: &Msg, react: bool) -> Vec<Value> {
             out
         }
         Speaker::Assistant => {
+            // Some providers (Kimi, #849) refuse an assistant message with nothing in it; blank text
+            // counts as nothing.
             let text = m.text();
+            let mut text = if text.trim().is_empty() { String::new() } else { text };
             if react {
-                return vec![json!({"role": "assistant", "content": text})];
+                // Calls made natively before the switch to the text protocol are written as the
+                // protocol's own lines, so the turn isn't empty and the model sees what it did.
+                if !text.contains("Action:") {
+                    for (_, name, input) in m.tool_uses() {
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str(&format!("Action: {name}\nAction Input: {input}"));
+                    }
+                }
+                return if text.is_empty() { Vec::new() } else { vec![json!({"role": "assistant", "content": text})] };
             }
             let calls: Vec<Value> = m
                 .tool_uses()
@@ -412,7 +433,10 @@ impl ChatStream {
             Some(f) => StopReason::parse(f),
             None if has_calls => StopReason::ToolUse,
             None if self.done => StopReason::EndTurn,
-            None => return Err(ToolError::new(ErrorCode::Truncated, "The answer stream ended early.")),
+            None => {
+                return Err(ToolError::new(ErrorCode::Truncated, "The answer stream ended early.")
+                    .with_remediation("The server ended the answer early (a local server may still be loading the model). Try again in a minute."));
+            }
         };
         // Some servers say "stop" for tool calls. A limit or refusal must still prevent execution.
         let stop = if has_calls && stop == StopReason::EndTurn { StopReason::ToolUse } else { stop };
@@ -936,6 +960,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn early_stream_end_is_reported_with_remediation() {
+        let st = ChatStream::default();
+        let err = st.finish("m").unwrap_err();
+        assert_eq!(err.code, ErrorCode::Truncated);
+        assert_eq!(err.message, "The answer stream ended early.");
+        let fix = err.remediation.as_deref().expect("remediation is set");
+        assert!(fix.contains("loading the model"));
+        assert!(fix.contains("Try again in a minute."));
+    }
+
     /// #369: OpenRouter routes to an upstream provider per request, and one without tool calling
     /// answered "400: Provider returned error". With tools in the request, only providers that
     /// support every parameter are used; nothing else changes.
@@ -1018,6 +1053,10 @@ mod tests {
         let b = react.body(&TurnRequest { system: "S", messages: &msgs, tools: &tools, effort: Effort::Low, max_tokens: 100 });
         assert!(b.get("tools").is_none());
         assert!(b["messages"][0]["content"].as_str().unwrap().contains("Action Input:"));
+        // A call made natively before the switch is sent as the protocol's lines, never as an empty
+        // assistant message (#849).
+        assert_eq!(b["messages"][2]["role"], "assistant");
+        assert_eq!(b["messages"][2]["content"], "Action: t\nAction Input: {\"a\":1}");
         assert!(b["messages"][3]["content"].as_str().unwrap().contains("Observation (error): bad"));
     }
 
@@ -1035,6 +1074,43 @@ mod tests {
     fn empty_assistant_message_is_omitted() {
         let empty = Msg { role: Speaker::Assistant, blocks: vec![] };
         assert!(messages_json(&empty, false).is_empty(), "empty assistant turn must produce no wire messages");
+    }
+
+    #[test]
+    fn blank_assistant_message_is_omitted_in_both_protocols() {
+        let blank = Msg { role: Speaker::Assistant, blocks: vec![Block::Text { text: " \n".into() }] };
+        let empty = Msg { role: Speaker::Assistant, blocks: vec![] };
+        for react in [false, true] {
+            assert!(messages_json(&blank, react).is_empty(), "react={react}");
+            assert!(messages_json(&empty, react).is_empty(), "react={react}");
+        }
+        // Blank text beside a tool call is left out, the call kept.
+        let tool = Msg {
+            role: Speaker::Assistant,
+            blocks: vec![Block::Text { text: "  ".into() }, Block::ToolUse { id: "c1".into(), name: "look".into(), input: json!({}) }],
+        };
+        let m = messages_json(&tool, false);
+        assert!(m.len() == 1 && m[0].get("content").is_none() && m[0]["tool_calls"].is_array(), "{m:?}");
+        assert_eq!(messages_json(&tool, true)[0]["content"], "Action: look\nAction Input: {}");
+        // A turn written in the protocol already keeps its own lines, once.
+        let written = Msg {
+            role: Speaker::Assistant,
+            blocks: vec![
+                Block::Text { text: "Thought: look\nAction: look\nAction Input: {}".into() },
+                Block::ToolUse { id: "react_0".into(), name: "look".into(), input: json!({}) },
+            ],
+        };
+        assert_eq!(messages_json(&written, true)[0]["content"], "Thought: look\nAction: look\nAction Input: {}");
+        // In a whole request (text protocol), the user turns either side are joined into one.
+        let user = |t: &str| Msg { role: Speaker::User, blocks: vec![Block::Text { text: t.into() }] };
+        let mut o = OpenAi::compatible("Kimi", "http://127.0.0.1:9", Some("sk-test".into()), "kimi");
+        o.react = true;
+        let msgs = [user("first"), blank, user("second")];
+        let b = o.body(&TurnRequest { system: "s", messages: &msgs, tools: &[], effort: Effort::Low, max_tokens: 100 });
+        assert_eq!(b["messages"].as_array().map(Vec::len), Some(2), "system, then the joined user turn");
+        let wire = b["messages"].as_array().unwrap();
+        assert!(wire.iter().all(|m| m["role"] != "assistant"), "{wire:?}");
+        assert!(wire.iter().all(|m| m["content"].as_str().is_some_and(|c| !c.trim().is_empty())), "{wire:?}");
     }
 
     #[test]

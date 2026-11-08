@@ -155,6 +155,9 @@ cheapest help we can give anyone, so nothing below should hold it up for long.
       — claimed: 00xJS, branch bugfix/r5.1-renderer-fallback
 - [ ] Live-check #794's fallback on a machine where DX12 refuses `egui_pipeline` (the reporter's
       780M, or lightcraft#812's)
+- [x] A window that fails after it was shown no longer says "The next start will draw with …": its
+      start mark is already gone, so the next start draws as before (#909 review); the dialog says
+      it only when the window was never shown (`next_start_note`) — claimed: 00xJS, branch bugfix/r5.1-retry-text-after-shown
 - [ ] Add to `docs/releasing.md`: before publishing, a Deep build through Claude Code from the
       finished package, on a Mac and on Windows. Starting the CLI from the package (#91) doesn't
       show whether Claude Code accepts its tools — PR #982; claimed: doubektomas,
@@ -232,9 +235,12 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       — claimed: SoldierPePe, branch test/r5.2-console-capture-flake
 - [ ] A console program that exits by itself and leaves programs attached to its console: closing
       it can still hang the console host on Windows Server 2022 (only a timeout ends the tree)
-- [ ] `process::launch_tests::a_watched_program_can_be_stopped` leaves its `sleep 30` (Windows:
+- [x] `process::launch_tests::a_watched_program_can_be_stopped` leaves its `sleep 30` (Windows:
       `ping -n 30`) running, on `main` too: `stop` ends the shell but not what the shell started
-      — in PR #1027
+      (#1027). Verified on Windows 11: after the test (5 runs) and after the whole
+      `craft-anything-platform` suite plus a 35 s wait, `tasklist` showed no `PING.EXE`. Not
+      checked: a panic before `stop`, dropping the handle without `stop`, Windows 10 or Server
+      — claimed: yashpatadiya1724-cmyk, branch docs/r5.2-watched-stop-windows-check
 - [x] `a_helper_is_judged_by_whether_it_runs` (ai crate) sometimes failed when several crates'
       tests ran at once: a script just written can't start while another thread's child still
       holds it open ("Text file busy"). #787 tries again: on Linux 4 of 72 runs failed before
@@ -244,8 +250,8 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       Compare with the folder's canonical path
 - [ ] Revisit the two advisory exceptions in `deny.toml`: `rsa` (no fix; we only verify with public
       keys) when rsa 0.10 lands, and unmaintained `zbus_names`/`zvariant` (Linux-only via keyring
-      and accesskit) when those move on. `deny.toml`'s comments say this is tracked in R0.3: point
-      them here
+      and accesskit) when those move on. `deny.toml`'s comments pointed at R0.3, which never held
+      them; they name this line now — claimed: kuseidos, branch docs/r5.2-deny-points-at-its-own-roadmap-line
 - [ ] Check whether the release workflows still run actions that target Node.js 20. None is named
       here any more: every job calls `storytold/craft-common-actions@main`, so a fix belongs there
 - [x] Correct STATUS.md's obsolete GUI-only limit: document the shared project feed, engine
@@ -268,9 +274,14 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       present mode and frame latency tried (AutoVsync, Fifo, Mailbox, Immediate; latency 1, 2, 3),
       so nothing in our frame pacing causes or avoids it; GL alone stays idle. Seen in the same way
       with PdfCraft and PhotoCraft (pdfcraft#3255) — claimed: 00xJS, branch docs/r5.2-idle-cpu-amd
-- [ ] **decision** AMD's idle driver thread costs Radeon owners a core on DX12 and Vulkan. Say so
-      in the troubleshooting docs (with `WGPU_BACKEND=gl` as the way out, which loads AMD's OpenGL
+- [ ] **decision** On the one Radeon measured (RX 6900 XT, driver 32.0.21045.16010, Windows 11
+      build 26300), AMD's idle driver thread costs a core on DX12 and Vulkan; other Radeons
+      (integrated ones too), drivers and Windows builds haven't been checked. Say so in the
+      troubleshooting docs (with `WGPU_BACKEND=gl` as the way out, which loads AMD's OpenGL
       driver), report it to AMD, or leave it
+- [x] Limit the decision line above to what was measured (one RX 6900 XT, one driver, one Windows
+      build) and say other Radeons and drivers aren't checked (#912 review)
+      — claimed: 00xJS, branch docs/r5.2-radeon-idle-scope
 
 ### R5.3 A builder that can't make progress stops
 Owner: open · Status: todo
@@ -403,6 +414,8 @@ been run live.
 - [ ] Find how each local server is told its context size and set it, or stop with a plain message
       when the prompt won't fit. We assume 24k and send no `num_ctx`, which an OpenAI-style endpoint
       may ignore anyway; LM Studio refused a 12.6k prompt on its 8k default (#73)
+- [x] When a server refuses a request for its context window and says the size (Ollama, llama.cpp,
+      OpenAI-style), fit the conversation to that window and ask once more, else say how to raise it (#962)
 - [x] A per-backend context budget in `[[ai.backends]]` (`LoopConfig::context_tokens` exists), for
       services whose real window differs from 150k (#374) — implementation: `6bd94b84828ec89b805cb8a246f557d0a778c037`
 - [x] Find LM Studio on another port (#73): the port in its settings file (when it is there) and
@@ -419,6 +432,7 @@ been run live.
 - [ ] A chat sent while a llama.cpp router is still loading the model ended after 31 s with "The
       answer stream ended early." and no next step (seen once live, 27B model); say the server may
       still be loading it and to try again in a minute
+      — claimed: yashpatadiya1724-cmyk, branch bugfix/r5.4-stream-loading-remediation
 
 ### R5.5 API-key builds fail in words people can use
 Owner: open · Status: todo
@@ -430,9 +444,17 @@ Owner: open · Status: todo
       turned-off backend is named and must be turned on, and a name that matches nothing is named
       instead of saying to install an agent or add a key
       — claimed: AlexJoaquimPereira, branch `bugfix/r5.5-disabled-backend-name`; commit a380b3e
-- [ ] When a project's saved builder was turned off, Start builds with the default AI without
+- [x] When a project's saved builder was turned off, Start builds with the default AI without
       saying so: the UI picker filters the stale name out (`ui-egui/src/builders.rs`) instead of
-      reporting that the chosen AI was replaced
+      reporting that the chosen AI was replaced. The Make picker says so in a toast, and every
+      start (Start, Continue, a note, Try again) names the saved AI and the one building instead
+      — claimed: AlexJoaquimPereira, branch `bugfix/r5.5-stale-builder-notice`
+- [x] `rebuild --continue-in`, `rebuild_start` on a project and `rebuild_question_ask` name the
+      saved builder that is off or gone and the AI building instead: the CLI prints it before the
+      run, `rebuild_start` adds `builder_notice`, and an answered question carries it
+      — claimed: AlexJoaquimPereira, branch `bugfix/r5.5-headless-builder-notice`
+- [ ] The saved-builder replacement notice is English only for now; add it to the catalogs after a
+      native speaker checks the wording
 - [x] Bound accumulated data across all lines of one server-sent event, so short lines cannot
       grow a streamed API response without limit
       — claimed: Afloat16, branch bugfix/r5.5-bounded-sse-events-20261103
@@ -466,14 +488,24 @@ Owner: open · Status: todo
 Golden rule 3: the result is evidence. Each fix needs a Mac to test on.
 - [x] macOS: a denied Accessibility permission is reported as success with an empty tree (#240)
       — claimed: mavericzz, branch bugfix/r5.6-accessibility-denied; PR #887
-- [ ] macOS: `runtime_ui_read` ignores `screenshot` (#248): the Swift helper declares it but
-      never captures an image
+- [x] macOS: `runtime_ui_read` captures a requested screenshot (#248): one on-screen window
+      belonging to the pid, restricted by `window_id` when supplied; PNG/base64 up to 2048 px
+      per side. Combined JSON (including escaping and the newline) stays within 16 MiB by
+      trimming the tree with explicit truncation and partial coverage, preserving the image.
+      Missing Screen Recording permission, a missing window or a capture failure produces
+      an explicit screenshot limitation and partial evidence. Denied Accessibility permission with
+      the tree enabled (the default) returns a tool error before capture; `accessibility: false`
+      skips the tree. Requires macOS 14+ and existing Screen Recording permission; opens no dialog
+      — claimed: Codex, branch bugfix/r5.6-macos-screenshot
 - [x] macOS: `runtime_ui_read` honours `accessibility: false` (#307): the Swift helper skips
       the tree and its permission check, returns no nodes without truncation, and the evidence
       records the flag and says the tree was skipped. Walkthroughs still require Accessibility
       — claimed: Codex, branch bugfix/r5.6-macos-ui-flags
-- [ ] macOS: call observation writes a literal `\n` into its lldb callback, so the Python is
-      invalid and it reports zero calls (#251)
+- [x] macOS: call observation's lldb callback was a literal `\n` in its Python, so the Python was
+      invalid and it reported zero calls (#251). Fixed under R2.4: the callback is one valid line
+      covering every breakpoint, and a failed lldb run is an error, not "0 calls"; only the live
+      lldb run is still owed (R5.7)
+      — claimed: mavericzz, branch docs/r5.6-stale-251; PR #1070
 
 ### R5.7 Live checks owed
 Owner: open · Status: todo
@@ -584,10 +616,23 @@ Owner: open · Status: in progress
 - [ ] Settings says when a saved agent program is gone and which one runs in its place; today a
       build moves to the newest build folder or the usual program without saying so, and the
       setting keeps the old path (read on a worker, not while drawing) (#721)
+- [x] A build says in its feed when it runs another program than the one saved in Settings → AI
+      (#721) — claimed: Agapenordev, branch bugfix/r2.2-build-says-replaced-program
 - [x] GitHub Copilot through its own CLI login and ACP, without credential import:
       discovery, MCP-only tool restrictions, model selection and fresh read-only questions;
       unit tests and CLI 1.0.105 with an isolated home and loopback model, all five access modes
       — claimed: qu-gg, branch `feature/r2.2-copilot-integration` (recorded during PR preparation)
+- [x] Grok Build as a coding agent over ACP (`grok agent stdio`): discovery in `~/.grok/bin`,
+      the person's own `grok login` (a missing `auth.json` is unknown, so an API key still
+      starts), model and reasoning effort, and our MCP server on the session with `"type": "stdio"`
+      only for Grok. Clean room, deep chat, and questions are refused, because Grok can read and
+      edit without a permission request. Verified against Grok 1.0.77's ACP handshake and
+      `session/set_config_option` (the CLI `--model` flag does not stick after `session/new`). A
+      live deep build on 2026-11-06 (Grok 1.0.77) finished, called the Craft Anything server, and
+      answered one permission request. Clean room and deep chat were not run live; those runs
+      are refused.
+      See [Grok Build](grok.md).
+      — branch `feature/r2.2-grok-agent`
 - [x] Review hardening: cap target handoff at 128 while preserving the active target; propagate
       context-discovery cancellation, normalize CLI-only efforts for Claude requests, and name
       the configured agent in shared picker warnings, with focused regressions and translations
@@ -645,6 +690,9 @@ Owner: open · Status: in progress
       assuming `/bin`; the shell uses the bounded process runner.
       Reproduced the old failure on macOS; the AI suite now passes (446 passed, 2 ignored). PR #1018
       — claimed: Codex, branch test/r2.2-posix-remote-helper
+- [x] Find OpenCode's CLI inside its Windows desktop app (`opencode-cli.exe`), for detection and for runs (#1060)
+- [ ] Settings → AI can only add an agent it detected: add one by choosing its program, for a CLI
+      kept somewhere we don't look (#1060)
 - [ ] Verify OpenCode model discovery and an explicit thinking selection on a live SSH host,
       and complete a live generation with the selected model and variant (local catalogue verified).
 
@@ -659,7 +707,12 @@ Owner: open · Status: in progress
       default once that passes
 - [x] Aider has no adapter, so the plain one hands it the prompt as a file name, and it can open a
       browser sign-in nobody agreed to (#72). Give it an adapter, or stop offering it — claimed: Afloat16, branch bugfix/r2.2-aider-recommendations-20261103
-- [ ] Add a non-interactive Aider adapter before recommending it again; detection currently leaves it out.
+- [x] Add a non-interactive Aider adapter before recommending it again; detection currently leaves it out.
+      Aider gets the message with `--message`, and flags that stop it asking, updating, editing
+      `.gitignore` or opening a page; a chat outside a build also gets `--dry-run`. Before a run it
+      refuses when no model or key is set up, or an OpenRouter model has no OpenRouter key: both
+      would offer a sign-in and wait for a browser nobody is at (#72).
+      — claimed: hasnain607, branch feature/r2.2-aider-adapter
 - [ ] Codex (#499): in a chat the tool server has no active target. The reporter attached a patch
       for chat continuity; look at that first
 - [x] Codex (#538): list every permitted tool from startup, since Codex doesn't refresh its callable
@@ -669,6 +722,7 @@ Owner: open · Status: in progress
       code) and a refusal explains the fix (`docs/codex.md`)
 - [ ] Codex (#540): run `codex exec` on a real install and check `rebuild_start` gets through
 - [ ] Codex: resume support (`codex exec resume <id>`), verified on a real install
+- [ ] Aider: move the message to `--message-file` once the launcher can write one (see the argv item above), and read project-folder `.aider.conf.yml` and `.env` in `check_setup`, which needs the working directory passed into `check_native_options`.
 - [ ] Every adapter but Claude Code's still takes the message in argv (`prompt_on_stdin`), so a long
       one can pass Windows' command-line limit as Claude Code's did (#402); hand each its message on
       stdin or in a file where its CLI reads one
@@ -757,8 +811,16 @@ Owner: open · Status: in progress
       own profile is left untouched. Verified with adapter and overlay tests and a live follow-up
       website build whose journal shows `rebuild_check`, `core_unknown_add` and `core_handoff_write`
       going through our server — claimed: 0231071, branch `feature/dsh-agent-adapter`
-- [ ] DeepSeek Harness: no resume (its headless profile keeps no session), a build on the harness's
-      desktop profile is untried, and the task still goes over in argv (see the argv note above)
+- [x] DeepSeek Harness: send tasks on stdin so multiline and long messages can start through the
+      Windows desktop launcher (see the argv note above)
+      — claimed: gtxy27, branch `bugfix/r2.2-dsh-stdin`
+- [ ] DeepSeek Harness: no resume (its headless profile keeps no session), and a build on the harness's
+      desktop profile is untried
+- [ ] `setup` writes the plain `mcp` command, so it drops an `--all-tools` an entry already has, and
+      `doctor` then calls that entry "a different copy or shape of the command" and suggests the very
+      command that breaks it. The installed skill now warns against running `setup` on such an entry;
+      `doctor` and `setup` should keep the person's extra arguments instead
+      — claimed: 18923837179wjt-dot, branch fix/setup-skill-warns-before-setup-drops-all-tools
 
 ### R2.4 Runtime study for apps and games (with consent)
 Owner: maintainers · Status: in progress
@@ -823,14 +885,17 @@ Owner: open · Status: in progress
       from the same process that supplied the picture, without falling back to unrelated names — PR #950
 - [x] Shared toolchain commands make project-local executables absolute before changing the
       working directory, preserving virtualenv paths for relative project placements — PR #950
-- [ ] Extend launch recipes beyond conventional root entrypoints: Python package scripts, Go
-      `cmd/` layouts, and Java build outputs; build checks already use their toolchain commands
+- [x] Launch a Go project with one `cmd/<name>/main.go` as a package when the root has no
+      `main.go` — claimed: Afloat16, branch feature/r2.7-go-command-layouts
+- [ ] Extend launch recipes to Python package scripts and Java build outputs; build checks already
+      use their toolchain commands
 - [ ] Audit relative project placements in build, option-run and Play paths too: runtime window
       capture now normalizes its request paths, but earlier runner paths can still be relative
 - [x] "player" alone doesn't make a request a game: a video or music player is an app (#953)
       — claimed: justinjohn0306, branch bugfix/953-player-not-a-game
-- [ ] Game words can't tell these apart from games: "a low level disk tool", "an MPEG 2 player",
-      "a single player app for movies". Telling them apart needs more than a list of words
+- [x] System-tool and media-player phrases keep the app target: "a low level disk tool",
+      "an MPEG 2 player" and "a single player app for movies". Independent game cues still apply
+      — claimed: Afloat16, branch bugfix/r2.7-media-and-system-apps
 
 ### R2.8 Clean room means clean room
 Owner: maintainers · Status: in progress
@@ -844,7 +909,9 @@ Gaps found while using the app for real projects.
       refuse): reading the web, commands, files outside the project, pushing and publishing,
       deleting outside the project, system changes, other tools. Unset kinds follow Auto mode as
       today. Found when Auto mode refused every `git push` without a card, so the person's OK in
-      the prompt box never reached the check, and refused `gh repo view` as publishing too
+      the prompt box never reached the check, and refused `gh repo view` as publishing too.
+      Tried live by a maintainer on Windows 10 (a release build of `main` at `b700e1d`,
+      2026-11-06): a builder's push was approved and went through
       — claimed: tanish2k09, branch feature/r2.9-project-approvals
 - [ ] Agents that don't ask our approval tool (OpenCode `--auto`, Hermes `-z`, Maki's `-p`) aren't
       held to a project's approval choices either; part of R2.2's approval decision
@@ -859,7 +926,7 @@ Gaps found while using the app for real projects.
       menu under the prompt box and `/approvals <kind> <allow|ask|refuse|default>`
       — claimed: tanish2k09, branch feature/r2.9-approvals-ui
 - [ ] The new approvals strings in every catalog were written with an AI; not reviewed by native
-      speakers yet
+      speakers yet — pt-BR claimed: marlonferreira1800-hue, branch docs/r2.9-approvals-pt-br-review
 - [x] Keep New project's content column fixed while the vertical scrollbar animates in or out,
       hiding it when there is nothing to scroll, so switching tabs never shifts the page horizontally
       — claimed: Codex, branch bugfix/r2.9-home-scrollbar-gutter
@@ -890,7 +957,10 @@ Gaps found while using the app for real projects.
 - [x] "Change it" knows what was just talked about in "Just ask": the next message tells the builder
       the latest few questions and answers, once, and a Clean room build only those asked in Clean
       room (#857). Not checked in a live build
-- [ ] A note sent while a build is running doesn't tell it what was asked in "Just ask" yet (#857)
+- [x] A note sent while a build is running tells it what was asked in "Just ask" (#857): the
+      note's hand-over file carries the answers, and the after-turn path puts them before the
+      notes; only answers the run's mode may show, marked told when read or sent
+      — claimed: AlexJoaquimPereira, branch bugfix/r2.9-note-just-ask; commit 78d3963
 - [ ] Record which mode a builder's session ran in: `agent_session` is kept across modes, so a Clean
       room build or question can resume a session from a Deep build and carry what it read, and such
       a question's answer is recorded as asked in Clean room. Don't resume one for Clean room
@@ -1027,8 +1097,9 @@ Owner: open · Status: todo
 ### R3.9 Game assets out
 Owner: open · Status: in progress
 - [ ] Unity: sounds out (the stored stream, usually FSB5; PCM ones as WAV)
-- [ ] Unity: crunched textures (DXT1Crunched, DXT5Crunched; two of the games checked use them) and
-      the float formats (RHalf, RGHalf, RGBAHalf, RFloat, RGFloat, RGBAFloat)
+- [ ] Unity: crunched textures (DXT1Crunched, DXT5Crunched; two of the games checked use them)
+- [x] Unity: the float formats (RHalf, RGHalf, RGBAHalf, RFloat, RGFloat, RGBAFloat)
+      — claimed: Afloat16, branch feature/r3.9-unity-float-textures
 - [ ] Unreal 5 and Oodle: IoStore packages, unversioned properties and Oodle-compressed paks
 - [ ] Game files: save pictures from IoStore containers (needs the Unreal 5 support above)
 - [ ] Unreal: sounds and meshes out (so a Deep-mode rebuild needs no outside converter for them)
@@ -1100,6 +1171,8 @@ Owner: open · Status: in progress
 - [x] Reject incomplete simple packet block payloads.
       — claimed: Afloat16, branch bugfix/r3.12-pcapng-simple-block-length-20261105
       Count rejected lengths against the packet scan limit and summarize them once at the end of the walk.
+- [x] Bound rejected packet records, validate timestamp fractions and check pcapng section-local interfaces.
+      — claimed: Afloat16, branch bugfix/r3.12-capture-timing-framing
 - [x] Keep ZIP directory entries within the declared directory.
       — claimed: Afloat16, branch bugfix/r3.12-zip-directory-bounds-20261105
 - [x] Refuse split ZIP archives without their other volumes.
@@ -1164,6 +1237,8 @@ Owner: open · Status: in progress
       ROMFS dot roots, cramfs, ext and JFFS2 sizes and holes, PyInstaller modules outside their
       PYZ, JSON config edits (comments kept, every duplicate key removed), and UDP, TCP, DNS over
       TCP, pcapng and TLS lengths (#688–#715, by Afloat16)
+- [x] Check ClientHello vector lengths and extension values before reporting the handshake as complete.
+      — claimed: Afloat16, branch bugfix/r3.12-tls-client-hello-values
 
 - [x] Address the combined parser review: preserve partial Java reference coverage,
       enforce DEX signed 32-bit LEB128 limits, recover legacy AAPT UTF-8 lengths within
@@ -1177,6 +1252,8 @@ Owner: open · Status: in progress
       exchanges, and report malformed records as incomplete instead of inventing answer values,
       while preserving legal empty DNS UPDATE RRset prerequisites
       — claimed: Afloat16, branch bugfix/r3.12-dns-rdata-names-review-20261104
+- [x] Keep address and service records attached to their owner and validate the record's wire fields.
+      — claimed: Afloat16, branch bugfix/r3.12-dns-record-evidence
 
 ### R3.13 Web inspection correctness
 Owner: open · Status: in progress
