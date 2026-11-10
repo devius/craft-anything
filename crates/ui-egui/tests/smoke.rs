@@ -252,6 +252,27 @@ fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
     h.get_by_label("Build without it");
 }
 
+/// A game's chosen folder is shown like every chosen folder: cut to fit its row, never widening the
+/// page, with the whole path on hover.
+#[test]
+fn a_long_game_folder_stays_inside_the_window() {
+    let folder = format!("D:/Games/{}/Cave Game", "A folder with a very long name ".repeat(12).trim());
+    let path = std::path::PathBuf::from(&folder);
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::deep(&mut a);
+        a.state.screen = Screen::GameFiles;
+        a.state.game.folder = Some(path);
+        a
+    });
+    h.run_steps(4);
+    let width = h.ctx.content_rect().width();
+    let shown = craft_anything_ui_egui::short_path(std::path::Path::new(&folder));
+    let r = h.get_by_label(&shown).rect();
+    assert!(r.right() <= width, "the folder ({r:?}) stays inside the {width}px window");
+    assert!(r.height() < 30.0, "it's cut to one line, not wrapped ({r:?})");
+}
+
 #[test]
 fn a_long_prompt_wraps_inside_the_window_in_the_project_and_the_chat() {
     use craft_anything_ui_egui::state::{ChatItem, FeedItem, UserItem};
@@ -775,8 +796,9 @@ fn an_approval_that_cant_be_saved_isnt_shown_as_chosen() {
     });
     h.run_steps(2);
     // A newer Craft Anything saved it meanwhile: this one only reads it, so the choice is refused.
-    let newer = std::fs::read_to_string(&file).unwrap().replacen("\"version\": 3", "\"version\": 99", 1);
-    assert!(newer.contains("\"version\": 99"));
+    let current = craft_anything_engine::workspace::MANIFEST_VERSION;
+    let newer = std::fs::read_to_string(&file).unwrap().replacen(&format!("\"version\": {current}"), &format!("\"version\": {}", current + 1), 1);
+    assert!(newer.contains(&format!("\"version\": {}", current + 1)));
     std::fs::write(&file, newer).unwrap();
     h.state_mut().state.project_input = "/approvals push allow".into();
     h.run_steps(1);
@@ -1369,6 +1391,17 @@ fn an_ai_server_is_added_by_its_address() {
     h.get_by_label("Add an AI by its address");
     h.state_mut().server_form = craft_anything_ui_egui::ServerForm { name: "Studio box".into(), address: url.clone(), ..Default::default() };
     h.run_steps(1);
+    // The AI settings page scrolls, and the key row added in #1486 puts the form's Add button
+    // below its visible part. A pointer click there lands outside the scroll area, so scroll the
+    // page first, as a person would.
+    h.event(egui::Event::PointerMoved(egui::pos2(640.0, 400.0)));
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -300.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(20);
     h.get_by_label("Add").click();
     assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Studio box" && b.model == "qwen3:8b")), "added with a model that can chat");
     assert!(h.state().server_form.name.is_empty(), "the form empties once it's added");
@@ -1399,6 +1432,29 @@ fn an_agent_apps_program_is_set_in_settings() {
     h.get_by_label("Program: /opt/oc/opencode");
     h.get_by_label("Find it automatically").click();
     assert!(wait(&mut h, |a| program(a).is_none()));
+}
+
+/// #721: an agent whose saved program is gone says so in Settings → AI, with the program that runs
+/// in its place. A program found by its usual name has no file to save, so nothing is offered.
+#[test]
+fn a_saved_program_that_is_gone_is_said_in_settings() {
+    use craft_anything_ai::{BackendEntry, BackendOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let gone = dir.path().join("old-build").join("agent").display().to_string();
+    let mut h = harness(move || {
+        let a = demo::app(demo::engine(Mode::Experienced, true));
+        // cargo stands in for the agent's usual program: it's there wherever these tests run.
+        let config = BackendConfig { name: "Moved".into(), kind: BackendKind::AgentCli, model: "cargo".into(), base_url: None, ssh_host: None, enabled: true };
+        a.hub.add_backend_with(BackendEntry { config, options: BackendOptions { command: Some(gone), ..Default::default() } }, None).unwrap();
+        a
+    });
+    h.state_mut().refresh_backends();
+    assert!(wait(&mut h, |a| a.program_replaced.get("Moved").is_some_and(|p| p == "cargo")));
+    h.state_mut().state.settings_open = true;
+    h.state_mut().state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+    h.run_steps(3);
+    h.get_by_label("It isn't there any more, so cargo runs in its place.");
+    assert!(h.query_by_label("Use it").is_none(), "a name on PATH isn't a file to save");
 }
 
 /// Claude Code's effort is chosen in Settings → AI, from every level Claude offers.
@@ -2734,6 +2790,43 @@ fn only_the_claude_desktop_app_is_named_when_nothing_can_build() {
     h.state_mut().detected = Some(vec![remote("Claude Code on box"), local]);
     h.run_steps(2);
     assert!(h.query_by_label("The Claude desktop app is installed, but building needs Claude Code, its separate command-line tool. Install Claude Code, sign in to it once in a terminal, then look again.").is_none());
+}
+
+/// A long reason on a card for an AI found on this computer wraps beside its Add button; it used
+/// to stay on one line and run on under the button.
+#[test]
+fn a_found_ais_long_reason_wraps_beside_its_add_button() {
+    use craft_anything_ai::Detected;
+    let reason = "Found the claude command on this computer, in a folder that another account's settings also point at, so adding it here uses the same sign-in as that one.";
+    let found = Detected {
+        suggestion: BackendConfig {
+            name: "Claude Code".into(),
+            kind: BackendKind::AgentCli,
+            model: "claude-code".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        },
+        reason: reason.into(),
+        needs_key: false,
+    };
+    let mut h = harness_sized(egui::vec2(900.0, 1000.0), move || {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        a.backends.clear();
+        a.detected = Some(vec![found]);
+        // The fixture is the discovery result; keep host detection out of this UI test.
+        a.detecting = true;
+        a.state.settings_open = true;
+        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        a
+    });
+    h.run_steps(4);
+    let text = h.get_by_label(reason).rect();
+    // The card's Add is the one on the reason's lines (the address form below has one too).
+    let add = h.query_all_by_label("Add").map(|n| n.rect()).find(|r| r.top() < text.bottom() && r.bottom() > text.top() - 30.0);
+    let add = add.expect("the card has an Add button beside its text");
+    assert!(text.right() <= add.left(), "the reason ({text:?}) ends before the Add button ({add:?})");
+    assert!(text.height() > 20.0, "the reason wraps onto more than one line ({text:?})");
 }
 
 #[test]
