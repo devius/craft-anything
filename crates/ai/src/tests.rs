@@ -101,12 +101,24 @@ fn mock(responses: Vec<(u16, &'static str, String)>) -> (String, Arc<Mutex<Vec<S
     let seen = Arc::new(Mutex::new(Vec::new()));
     let s2 = seen.clone();
     std::thread::spawn(move || {
-        for (status, ctype, reply) in responses {
+        let mut responses = responses.into_iter().peekable();
+        while let Some((next_status, next_type, _)) = responses.peek() {
+            let lists_next = *next_status == 200 && *next_type == "application/json";
             let Ok((stream, _)) = l.accept() else { return };
             let mut r = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             r.read_line(&mut line).unwrap();
             let path = line.split_whitespace().nth(1).unwrap_or_default().to_string();
+            // Scripted questions are model lists answered with a list. Any other question is a
+            // window probe (crate::window) the test didn't script: say nothing, as a server that
+            // doesn't report its window does, and keep the scripted answer for the request after.
+            if line.starts_with("GET ") && !(lists_next && path.ends_with("/models")) {
+                let mut w = stream;
+                write!(w, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                w.flush().unwrap();
+                continue;
+            }
+            let Some((status, ctype, reply)) = responses.next() else { return };
             let mut headers = Vec::new();
             let mut len = 0usize;
             loop {
@@ -404,7 +416,7 @@ fn opencode_selection_is_validated_saved_and_run_natively_with_our_mcp_server() 
     let seen = dir.path().join("arguments.txt");
     let quote = |p: &std::path::Path| ssh::shell_quote(&p.display().to_string());
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\napi) cat {};;\nrun) printf '%s\\n' \"$@\" > {}; cat \"$OPENCODE_CONFIG\" >> {}; printf 'done';;\n*) exit 8;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\napi) cat {};;\nrun) if [ \"$2\" = '--help' ]; then printf '%s\\n' '--format --standalone'; exit 0; fi; printf '%s\\n' \"$@\" > {}; cat \"$OPENCODE_CONFIG\" >> {}; printf 'done';;\n*) exit 8;;\nesac\n",
         quote(&catalogue),
         quote(&seen),
         quote(&seen)
@@ -1588,6 +1600,31 @@ fn a_saved_api_key_can_be_replaced_or_forgotten() {
     assert!(h.saved_backend_key("Agent").is_err());
     assert!(h.set_backend_key("Agent", "sk-new").is_err(), "a coding agent keeps its own sign-in");
     assert!(h.remove_backend_key("Agent").is_err());
+}
+
+/// A key save and another key or backend change wait for each other: a save can't write the key
+/// after a remove has deleted the backend and its key.
+#[test]
+fn a_key_save_waits_for_another_backend_change() {
+    let (h, _d) = hub();
+    add(&h, "OpenAI", BackendKind::Openai, "https://api.openai.com/v1", None);
+    let h = Arc::new(h);
+    let edit = h.backend_edits.lock().unwrap();
+    let (started, started_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let h = h.clone();
+        std::thread::spawn(move || {
+            started.send(()).unwrap();
+            h.set_backend_key("OpenAI", "sk-new")
+        })
+    };
+    started_rx.recv().unwrap();
+    // While another change holds the lock, the save can't reach the keychain.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!worker.is_finished(), "the save waits for the other backend change");
+    drop(edit);
+    worker.join().unwrap().unwrap();
+    assert_eq!(h.keys.get("OpenAI").as_deref(), Some("sk-new"));
 }
 
 /// #369: when OpenRouter has no provider that supports tools for a model (404 once only those are

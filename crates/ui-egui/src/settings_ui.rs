@@ -653,9 +653,13 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                     toggle = Some((b.name.clone(), !b.enabled));
                 }
                 if confirming.as_ref() == Some(&b.name) {
-                    if widgets::secondary(ui, Some("trash-2"), "Remove it and its key").clicked() {
-                        remove = Some(b.name.clone());
-                    }
+                    // A key save or forget for this backend is still running: the save could
+                    // write the key back after the backend and its key are gone.
+                    ui.add_enabled_ui(!app.backend_key_pending.contains(&b.name), |ui| {
+                        if widgets::secondary(ui, Some("trash-2"), "Remove it and its key").clicked() {
+                            remove = Some(b.name.clone());
+                        }
+                    });
                     if widgets::link(ui, "Keep it").clicked() {
                         ui.data_mut(|d| d.remove::<String>(confirm_id));
                     }
@@ -747,22 +751,18 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     }
     ui.add_space(8.0);
     let detected = app.detected.clone().unwrap_or_default();
-    let mut tab = {
-        let (providers, harnesses) = crate::detect_tabs::counts(&detected);
-        crate::detect_tabs::resolve(app.state.detect_tab, providers, harnesses)
-    };
-    ui.horizontal(|ui| {
-        widgets::caption(ui, "Found on this computer");
-        ui.add_space(12.0);
-        tab = crate::detect_tabs::bar(ui, &mut app.state.detect_tab, &detected);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    widgets::caption(ui, "Found on this computer");
+    let tab = ui
+        .horizontal_wrapped(|ui| {
+            let tab = crate::detect_tabs::buttons(ui, &mut app.state.detect_tab, &detected);
             if app.detecting {
                 ui.add(crate::widgets::Spinner::new().color(t.accent));
             } else if widgets::secondary(ui, Some("radar"), "Detect").clicked() {
                 app.detect_backends();
             }
-        });
-    });
+            tab
+        })
+        .inner;
     ui.add_space(4.0);
     if detected.is_empty() && !app.detecting {
         ui.label(
