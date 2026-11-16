@@ -1279,6 +1279,7 @@ dependencies = [
  "craft-anything-js",
  "craft-anything-platform",
  "craft-anything-testkit",
+ "craft-sniff",
  "dirs",
  "hex",
  "image",
@@ -1318,6 +1319,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "ureq",
  "wasmtime",
+ "winreg 0.55.0",
 ]
 
 [[package]]
@@ -1337,6 +1339,7 @@ version = "0.6.1"
 dependencies = [
  "bzip2-rs",
  "craft-anything-testkit",
+ "craft-plist",
  "lzma-rs",
  "miniz_oxide 0.8.9",
  "object 0.36.7",
@@ -1483,6 +1486,19 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
 ]
+
+[[package]]
+name = "craft-plist"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=902a722422583d051093679985793fb94b2af26e#902a722422583d051093679985793fb94b2af26e"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "craft-sniff"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=070005125f0af1a5ae4a59002270e5849505bfc0#070005125f0af1a5ae4a59002270e5849505bfc0"
 
 [[package]]
 name = "craft-update"
@@ -8392,6 +8408,7 @@ dependencies = [
  "craft-anything-engine",
  "proc-macro2",
  "syn 2.0.119",
+ "tempfile",
  "toml 0.9.12+spec-1.1.0",
 ]
 
