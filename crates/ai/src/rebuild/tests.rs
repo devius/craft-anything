@@ -383,6 +383,43 @@ fn a_launcher_leads_to_the_game_and_its_files() {
     assert!(inv.contains("Read-me and licence files: 1 files") && !inv.contains("Settings and scripts"), "{inv}");
 }
 
+/// A 1990s Windows game's folder copied to Linux or macOS: no file has an executable
+/// bit, so only counting programs this computer can start found none, and Deep mode skipped Ghidra.
+#[test]
+fn a_windows_games_folder_has_its_program_on_every_system() {
+    let d = tempfile::tempdir().unwrap();
+    let game = d.path();
+    std::fs::create_dir_all(game.join("Install")).unwrap();
+    for (name, bytes) in [
+        ("Game.exe", 454),
+        ("Launcher.exe", 173),
+        ("setup.exe", 900),         // bigger, but an installer
+        ("Install/setup.exe", 800), // the same, one folder down
+        ("MSVCRT40.DLL", 1000),     // bigger still, but a library, not the game
+        ("game.dat", 4600),
+    ] {
+        std::fs::write(game.join(name), vec![0u8; bytes]).unwrap();
+    }
+    assert_eq!(locate(game, "game"), (game.join("Game.exe"), Some(game.to_path_buf())), "the game's own program");
+    let bat = game.join("play.bat");
+    std::fs::write(&bat, "start Launcher.exe\n").unwrap();
+    assert_eq!(locate(&bat, "app").0, game.join("Launcher.exe"), "the program a launcher starts");
+    assert!(studies_as_program(&game.join("GAME.EXE")) && !studies_as_program(&game.join("MSVCRT40.DLL")));
+}
+
+#[test]
+fn a_windows_console_program_is_studied_but_started_only_on_windows() {
+    let d = tempfile::tempdir().unwrap();
+    let folder = d.path();
+    std::fs::write(folder.join("Tool.exe"), craft_anything_testkit::pe64_subsystem(3)).unwrap();
+    let program = locate(folder, "game").0;
+    assert_eq!(program, folder.join("Tool.exe"), "picked for Deep study on every system");
+    // Without the start check, runtime study would run it with each input, as a console program.
+    assert!(kinds::runs::is_console(&program), "a console program by its PE header");
+    assert_eq!(study::may_start(&program), cfg!(windows), "started only where Windows programs run");
+    assert!(!study::may_start(folder), "a folder is never started");
+}
+
 #[test]
 fn a_mac_app_bundle_is_studied_through_the_program_it_names() {
     let d = tempfile::tempdir().unwrap();
@@ -4300,7 +4337,9 @@ fn a_question_names_a_replaced_saved_builder() {
     let answered = super::question::ask(&hub, &settings, None, &ws, "where is it?", &CancelToken::default()).unwrap();
     assert_eq!(answered.backend, "Claude");
     let notice = answered.builder_notice.as_deref().unwrap_or_default();
-    assert!(notice.contains("Off") && notice.contains("Claude"), "{notice}");
+    assert_eq!(notice, "The AI chosen for this project (Off) is turned off or no longer set up. Claude builds instead.");
+    let response = serde_json::to_value(&answered).unwrap();
+    assert_eq!(response["builder_replacement"], serde_json::json!({"saved": "Off", "used": "Claude"}));
 }
 
 /// A name given on purpose is never ignored: a backend that is off is refused in words that say
